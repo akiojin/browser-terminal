@@ -85,3 +85,47 @@ DA replies via the WS input channel. Mouse reporting modes are not handled.
     POST /api/exec take the token in the JSON body (the server's existing
     contract), GET /api/transcript returns JSON whose "text" contains the
     exec output with no ANSI escapes. All PASS — server behavior unchanged.
+
+## 8. Node.js rewrite (2026-11-13)
+Change: the server was rewritten from Rust to Node.js (owner decision,
+2026-11-13: target dev machines usually have Node already, so the tool runs
+on top of it). Stack: node-pty (PTY), ws (WebSocket), smol-toml (config).
+Entry point src/server.js; UI src/ui.html is unchanged. The Rust
+implementation is preserved on the `rust-impl` branch (at 194c8bf).
+
+Environment: Linux (x86_64 VM), Node v24.22.1, npm 10.9.4.
+
+8a. Install: `npm install` — ws 8.x, smol-toml, node-pty 1.1.0 installed.
+    VM-specific note: node-gyp's own header download failed on this VM
+    (its tar extraction hits "EPERM: operation not permitted, fchown" on
+    this filesystem), so the headers were extracted manually and the
+    install was run with npm_config_nodedir set. node-pty then built and
+    loads, and a spawn smoke test printed the expected output. On a normal
+    machine the plain `npm install` path (prebuild or node-gyp) applies.
+8b. Automated harness (~/workspace/bt-verify/run-verify.js, 30 checks, all
+    PASS), same coverage as sections 2-6:
+    Run A (fresh config auto-created, port 17337, api_enabled=false):
+    config created with a generated token, permissions 0600; GET / no
+    token 401 / ?token 200 / Bearer 200 / wrong token 401; /api/sessions
+    404 while disabled; /sessions without token 401. Two WS sessions with
+    distinct ids; `echo BT_OK_$((12340+5))` -> "BT_OK_12345"; session1
+    `cd /tmp; pwd` -> /tmp while session2 `pwd` -> /home/hatch (independent
+    cwd, persists); GET /sessions lists both alive. Reattach to session1
+    over a new WS returned the same id and replayed scrollback containing
+    the earlier output. audit.log next to the config records the WS
+    commands with via=ws (5 lines).
+    Run B (port 17338, api_enabled=true): /api/sessions without token 401;
+    POST /api/sessions -> created; POST /api/exec -> {ok:true, seq}; exec
+    also accepts the token in the JSON body (original contract);
+    transcript contains "API_OK_6789" and the home cwd with NO ANSI
+    escapes; since=9999 -> empty text with the latest seq; /api/sessions
+    lists the session; two API sessions keep independent cwds; audit.log
+    records API commands with via=api.
+8c. Default config path: with XDG_CONFIG_HOME pointed at a scratch dir,
+    the server created <dir>/browser-terminal/config.toml (153 bytes,
+    mode 0600) and listened on 127.0.0.1:17337 — same layout as the Rust
+    build.
+8d. UI unit tests: tests/term-core.test.js (unchanged TermCore) — ALL
+    UNIT TESTS PASSED.
+
+RESULT: ALL CHECKS PASSED.
