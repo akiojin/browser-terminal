@@ -42,3 +42,46 @@ Binary: target/release/browser-terminal (3.6 MB).
   Output text is not logged. Verified entries for: echo, cd /tmp, pwd (x3) via ws.
 
 All checks passed.
+
+## 7. Real-terminal UI rework (2026-11-13)
+Change: the append-only log view + bottom input box was replaced by a real
+terminal UI, per the owner's decision. src/ui.html now contains a cell-grid
+terminal emulator (TermCore, plain JavaScript, DOM text rendering — no
+canvas) and direct key input on the output area (hidden textarea + IME
+composition events, paste with bracketed-paste support, block cursor).
+src/main.rs is unchanged.
+
+Implemented control handling: CR/LF/BS/TAB, CSI cursor moves (A/B/C/D/E/F/
+G/H/f/d/e/a/`), ED/EL modes 0-2 (+ED 3 clears scrollback), IL/DL/DCH/ICH/
+ECH, SU/SD, CBT, REP, DECSTBM scroll region, insert mode (CSI 4), DECAWM
+(?7), DECCKM app cursor keys (?1), cursor visibility (?25), alt screen
+(?47/?1047/?1049 with cursor save/restore, ?1048), bracketed paste (?2004),
+SGR incl. 256-color and truecolor, DEC special graphics charset, wide
+(East Asian) characters, combining characters, DSR (CSI 6n / 5n) and primary
+DA replies via the WS input channel. Mouse reporting modes are not handled.
+
+7a. Build: `cargo build --release` SUCCESS (15.75s).
+7b. Unit tests (Node v24, tests/term-core.test.js extracts TermCore from
+    src/ui.html): 35/35 PASS — CR overwrite ("hello\rH" -> "Hello"), \r
+    progress overwrite, line-edit redraw with CR+CSI K and with CUF+EL,
+    backspace, SGR 16/256/truecolor on cells, scrollback flow on a 3-row
+    screen, wrap + DECAWM off, alt screen restore, ICH/DCH/IL, ED/EL,
+    scroll region isolation, DSR reply, wide chars, tab stops, CSI split
+    across chunks, OSC consumption, reverse index.
+7c. Live integration (Python websocket-client vs run A on port 17339):
+    resize 80x24, typed "echo BT2_OJ" one char at a time, sent Backspace,
+    then "K" and Enter; plus printf 'a\rb\n' and printf 'xx\ryy\n'. The raw
+    server stream fed through TermCore renders: command line "echo BT2_OK",
+    output line "BT2_OK", no "BT2_OJ" anywhere, overwrite lines "b" and
+    "yy". PASS.
+7d. less smoke test: `seq 1 100 | less` — while open, TermCore reports the
+    alt screen active and shows number lines with the shell screen hidden;
+    after "q" the alt screen exits and the shell screen (incl. the command
+    line) is restored. PASS.
+7e. Regression: token auth (no token 401 / good token 200 / wrong token
+    401 / API disabled 404 / API without token 401), GET /sessions lists
+    the WS-created session, reattach replays scrollback containing earlier
+    output, agent API on run B (port 17340): POST /api/sessions and
+    POST /api/exec take the token in the JSON body (the server's existing
+    contract), GET /api/transcript returns JSON whose "text" contains the
+    exec output with no ANSI escapes. All PASS — server behavior unchanged.
