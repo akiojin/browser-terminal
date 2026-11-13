@@ -1,0 +1,44 @@
+# Verification log — browser-terminal prototype (Linux VM, 2026-11-13)
+
+Environment: Linux (x86_64 VM), cargo/rustc from ~/.cargo/bin, Python 3.12 + websocket-client.
+
+## 1. Build
+Command: `cargo build --release`
+Result: SUCCESS — "Finished `release` profile [optimized] target(s) in 2m 05s".
+Binary: target/release/browser-terminal (3.6 MB).
+
+## 2. HTTP auth (run A: fresh config auto-created at /tmp/bt-a/config.toml, port 17337, api_enabled=false)
+- Config file was auto-created on first run with a generated token, permissions -rw------- (0600).
+- `curl /` without token            -> 401
+- `curl /?token=<token>`            -> 200 (UI page, <title>browser-terminal</title> present)
+- `curl /` with Authorization: Bearer <token> -> 200
+- `curl /?token=wrong`              -> 401
+- `curl /api/sessions?token=<token>` with api_enabled=false -> 404 (API disabled)
+
+## 3. WebSocket sessions (python3 /tmp/bt_ws_test.py, against run A)
+- session1 created (id=0029d47c), session2 created (id=f71b56db) — distinct ids.
+- `echo BT_OK_$((12340+5))` in session1 -> output contained "BT_OK_12345" ... PASS
+- session1: `cd /tmp` then `pwd` -> "/tmp" ... PASS
+- session2: `pwd` -> "/home/hatch" (independent cwd, unaffected by session1) ... PASS
+- session1: `pwd` again -> "/tmp" (per-session state persists) ... PASS
+- RESULT: ALL WS TESTS PASSED
+
+## 4. Agent API (run B: /tmp/bt-b/config.toml, port 17338, api_enabled=true, dummy test token)
+- POST /api/sessions {"name":"api-test"} -> {"id":"b0e27445","name":"api-test","alive":true}
+- POST /api/exec {session, command:"echo API_OK_$((6780+9)) && pwd"} -> {"ok":true,"seq":2}
+- GET  /api/transcript?session=<id>&since=0 -> text contains "API_OK_6789" and "/home/hatch",
+  and contains NO ANSI escape characters (plain text) ... PASS
+- GET  /api/transcript?since=9999 -> empty text, latest seq reported (incremental reads work)
+- GET  /api/sessions -> lists the session ... PASS
+- GET  /api/sessions without token -> 401
+
+## 5. Reattach (WebSocket)
+- WS connect with session=<existing id from API> -> server returned the same session id and
+  replayed the scrollback (contained the earlier "API_OK_6789" output) ... PASS
+
+## 6. Audit log
+- Commands sent over WS and via the API were appended to audit.log next to the config file,
+  one line per command: "<rfc3339 timestamp>\tsession=<name>\tvia=<ws|api>\t<command>".
+  Output text is not logged. Verified entries for: echo, cd /tmp, pwd (x3) via ws.
+
+All checks passed.

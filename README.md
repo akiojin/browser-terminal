@@ -1,0 +1,130 @@
+# browser-terminal
+
+A tiny local web terminal: a single Rust binary runs a real shell on a PTY and
+serves one web page, so you can operate that shell from a browser tab.
+
+It was designed so that an AI agent can drive a terminal through a browser —
+typing commands into a real input field and reading the output as real DOM
+text — on machines where the agent cannot operate the OS terminal app
+directly. Humans can of course use it as a plain browser terminal too.
+
+- One binary, no runtime dependencies. macOS / Windows / Linux.
+- Multiple independent sessions: one browser tab = one terminal session.
+  Sessions live on the server side, so closing a tab does not kill the shell;
+  reopen the page and reattach, with the scrollback replayed.
+- Output is rendered as DOM text (not a canvas). ANSI colors are supported,
+  and the text itself stays in the DOM so it can be selected, searched and
+  read reliably.
+- Optional agent API (off by default): create sessions, inject commands, and
+  read back a plain-text (ANSI-stripped) transcript with incremental `seq`
+  offsets.
+
+See [docs/design.md](docs/design.md) for the design notes (Japanese).
+
+## Security model
+
+This tool exposes a shell. It is built to be safe by default:
+
+- **Localhost only.** The server binds to `127.0.0.1`. There is no LAN or
+  internet exposure in v1. Do not put it behind a public reverse proxy.
+- **Token required everywhere.** The UI, the WebSocket and the API all
+  require an access token (`Authorization: Bearer <token>` header, or
+  `?token=` for the page/WebSocket). A token is generated on first run and
+  stored in the config file, which is created with `0600` permissions.
+  Treat the token like a password.
+- **sudo is yours to type.** The server never stores, handles or injects
+  passwords. If a command asks for a sudo password, the PTY presents the
+  prompt and a human types the password at the terminal, as usual.
+- **Audit log.** Every command line submitted (via the UI or the API) is
+  appended with a timestamp to `audit.log` next to the config file.
+  Command output is not logged.
+- **Agent API is opt-in.** `/api/*` returns 404 unless `api_enabled = true`
+  is set in the config.
+
+## Build
+
+Requires a Rust toolchain.
+
+```sh
+cargo build --release
+# binary: target/release/browser-terminal
+```
+
+- macOS: `cargo build --release` on a Mac produces the macOS binary
+  (shell: `$SHELL`, falling back to zsh, then bash).
+- Windows: `cargo build --release` on Windows produces the `.exe`
+  (shell: `pwsh` if installed, otherwise Windows PowerShell; PTY via ConPTY,
+  Windows 10 1809+).
+- Linux: shell is `$SHELL`, falling back to zsh, then bash.
+
+## Run
+
+```sh
+./target/release/browser-terminal [--config /path/to/config.toml]
+```
+
+On first run it creates a config file and prints the URL to open, including
+the token:
+
+```
+browser-terminal listening on http://127.0.0.1:17337/?token=<your token>
+```
+
+Config file location (default):
+
+- Linux: `~/.config/browser-terminal/config.toml`
+- macOS: `~/Library/Application Support/browser-terminal/config.toml`
+- Windows: `%APPDATA%\browser-terminal\config.toml`
+
+Open the printed URL in a browser tab. Open it again in another tab (or use
+"New session") for a second, independent terminal. Use the session dropdown
+to reattach to an existing session.
+
+## Configuration
+
+```toml
+port = 17337              # fixed port
+token = "..."             # generated on first run; keep secret
+bind = "127.0.0.1"        # v1: localhost only
+api_enabled = false       # enable the agent API
+# shell = "/bin/zsh"      # optional shell override
+scrollback_bytes = 262144 # raw scrollback kept per session
+# audit_log = "audit.log" # path (relative to the config dir) 
+```
+
+## Agent API (when `api_enabled = true`)
+
+All endpoints require the token.
+
+```sh
+# create a session
+curl -X POST http://127.0.0.1:17337/api/sessions \
+  -H "Authorization: Bearer <token>" -d '{"name":"work"}'
+
+# list sessions
+curl http://127.0.0.1:17337/api/sessions -H "Authorization: Bearer <token>"
+
+# run a command in a session (returns the transcript seq at injection time)
+curl -X POST http://127.0.0.1:17337/api/exec \
+  -H "Authorization: Bearer <token>" \
+  -d '{"session":"<id>","command":"echo hello && pwd"}'
+
+# read new output since a seq (plain text, ANSI stripped)
+curl "http://127.0.0.1:17337/api/transcript?session=<id>&since=<seq>" \
+  -H "Authorization: Bearer <token>"
+```
+
+## Status
+
+Prototype (v0.1). Implemented: PTY sessions with per-session state,
+multi-session + reattach with scrollback replay, DOM-text UI with ANSI
+colors, line input with history, Ctrl-C / Ctrl-D buttons, token auth,
+optional agent API, audit log.
+
+Not yet (v2 candidates): raw key-input mode for full-screen programs
+(vim, top, …), session idle timeout, OS service registration helpers
+(launchd / systemd / Windows service), color themes.
+
+## License
+
+MIT

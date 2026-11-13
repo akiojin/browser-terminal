@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>browser-terminal</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-monospace, Menlo, Consolas, monospace;
+         background: #0c0c0c; color: #d4d4d4; display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; flex-wrap: wrap; gap: 0.5em; align-items: center;
+           padding: 0.4em 0.6em; background: #1a1a1a; border-bottom: 1px solid #333; font-size: 13px; }
+  header .dot { width: 10px; height: 10px; border-radius: 50%; background: #888; display: inline-block; }
+  header .dot.on { background: #4caf50; }
+  header .dot.off { background: #e53935; }
+  button, select, input { font: inherit; background: #262626; color: #d4d4d4;
+           border: 1px solid #444; border-radius: 4px; padding: 0.3em 0.6em; }
+  button:hover { background: #333; cursor: pointer; }
+  #out { flex: 1; overflow-y: auto; padding: 0.6em; white-space: pre-wrap; word-break: break-all;
+         font-size: 13px; line-height: 1.45; }
+  #out .line { min-height: 1.45em; }
+  footer { display: flex; gap: 0.5em; padding: 0.5em 0.6em; background: #1a1a1a; border-top: 1px solid #333; }
+  #cmd { flex: 1; }
+  .grow { flex: 1; }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot" class="dot"></span>
+  <span id="status">connecting…</span>
+  <span>session:</span>
+  <select id="sessions"></select>
+  <button id="attach">Attach</button>
+  <button id="new">New session</button>
+  <span class="grow"></span>
+  <button id="ctrlc" title="Send Ctrl-C">Ctrl-C</button>
+  <button id="ctrld" title="Send Ctrl-D (EOF)">Ctrl-D</button>
+  <button id="clear">Clear</button>
+  <button id="reconnect">Reconnect</button>
+  <button id="kill">Kill session</button>
+</header>
+<div id="out"></div>
+<footer>
+  <input id="cmd" type="text" placeholder="type a command and press Enter" autocomplete="off" spellcheck="false">
+  <button id="send">Send</button>
+</footer>
+
+<script>
+"use strict";
+// --- token handling -------------------------------------------------------
+const params = new URLSearchParams(location.search);
+let token = params.get("token") || sessionStorage.getItem("bt_token") || "";
+if (params.get("token")) {
+  token = params.get("token");
+  sessionStorage.setItem("bt_token", token);
+  params.delete("token");
+  history.replaceState(null, "", location.pathname + (params.toString() ? "?" + params : ""));
+}
+let sessionId = params.get("session") || null;
+
+// --- ANSI -> DOM renderer -------------------------------------------------
+const out = document.getElementById("out");
+const PALETTE = ["#0c0c0c","#c50f1f","#13a10e","#c19c00","#0037da","#881798","#3a96dd","#cccccc",
+                 "#767676","#e74856","#16c60c","#f9f1a5","#3b78ff","#b4009e","#61d6d6","#f2f2f2"];
+let curLine = null, curSpan = null, style = {};
+function resetStyle() { style = { fg: null, bg: null, bold: false }; }
+resetStyle();
+function styleKey() { return (style.fg||"") + "|" + (style.bg||"") + "|" + (style.bold?1:0); }
+let lastKey = null;
+function newLine() {
+  curLine = document.createElement("div");
+  curLine.className = "line";
+  out.appendChild(curLine);
+  curSpan = null; lastKey = null;
+  while (out.childElementCount > 1000) out.removeChild(out.firstChild);
+}
+function putChar(ch) {
+  if (!curLine) newLine();
+  const key = styleKey();
+  if (!curSpan || key !== lastKey) {
+    curSpan = document.createElement("span");
+    if (style.fg) curSpan.style.color = style.fg;
+    if (style.bg) curSpan.style.backgroundColor = style.bg;
+    if (style.bold) curSpan.style.fontWeight = "bold";
+    curSpan.textContent = "";
+    curLine.appendChild(curSpan);
+    lastKey = key;
+  }
+  curSpan.textContent += ch;
+}
+function applySgr(codes) {
+  if (codes.length === 0) codes = [0];
+  for (let i = 0; i < codes.length; i++) {
+    const c = codes[i];
+    if (c === 0) resetStyle();
+    else if (c === 1) style.bold = true;
+    else if (c === 22) style.bold = false;
+    else if (c >= 30 && c <= 37) style.fg = PALETTE[c - 30];
+    else if (c === 39) style.fg = null;
+    else if (c >= 40 && c <= 47) style.bg = PALETTE[c - 40];
+    else if (c === 49) style.bg = null;
+    else if (c >= 90 && c <= 97) style.fg = PALETTE[c - 90 + 8];
+    else if (c >= 100 && c <= 107) style.bg = PALETTE[c - 100 + 8];
+  }
+}
+// Incremental escape-sequence parser state.
+let escState = 0, escBuf = "";
+function feedText(text) {
+  for (const ch of text) {
+    if (escState === 1) { // after ESC
+      if (ch === "[") { escState = 2; escBuf = ""; }
+      else if (ch === "]") { escState = 3; }
+      else if (ch === "(" || ch === ")") { escState = 4; }
+      else { escState = 0; }
+      continue;
+    }
+    if (escState === 2) { // CSI
+      if (ch >= "@" && ch <= "~") {
+        if (ch === "m") {
+          const codes = escBuf.split(";").filter(s => s !== "").map(Number);
+          applySgr(codes);
+        }
+        escState = 0;
+      } else escBuf += ch;
+      continue;
+    }
+    if (escState === 3) { // OSC, ends with BEL
+      if (ch === "\x07") escState = 0;
+      continue;
+    }
+    if (escState === 4) { escState = 0; continue; }
+    if (ch === "\x1b") { escState = 1; continue; }
+    if (ch === "\n") { newLine(); continue; }
+    if (ch === "\r") { // carriage return: rewrite current line
+      if (curLine) { curLine.textContent = ""; curSpan = null; lastKey = null; }
+      continue;
+    }
+    if (ch === "\x08") continue; // ignore backspace in log view
+    if (ch < " " && ch !== "\t") continue;
+    putChar(ch);
+  }
+  out.scrollTop = out.scrollHeight;
+}
+
+// --- WebSocket ------------------------------------------------------------
+const dot = document.getElementById("dot");
+const statusEl = document.getElementById("status");
+const decoder = new TextDecoder("utf-8");
+let ws = null;
+function setStatus(text, on) {
+  statusEl.textContent = text;
+  dot.className = "dot " + (on === true ? "on" : on === false ? "off" : "");
+}
+function connect() {
+  if (ws) { try { ws.close(); } catch (e) {} }
+  const q = new URLSearchParams({ token });
+  q.set("session", sessionId || "new");
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?" + q);
+  ws.binaryType = "arraybuffer";
+  setStatus("connecting…", null);
+  ws.onopen = () => { setStatus("connected", true); sendResize(); document.getElementById("cmd").focus(); };
+  ws.onclose = () => setStatus("disconnected", false);
+  ws.onerror = () => setStatus("error", false);
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === "session") {
+          sessionId = msg.id;
+          setStatus("connected — " + msg.name + (msg.alive ? "" : " (exited)"), true);
+          document.title = "browser-terminal — " + msg.name;
+          const p = new URLSearchParams(location.search);
+          p.set("session", sessionId); p.delete("token");
+          history.replaceState(null, "", location.pathname + "?" + p);
+          refreshSessions();
+        } else if (msg.type === "error") {
+          setStatus("error: " + msg.message, false);
+        }
+        return;
+      } catch (e) { /* not JSON: fall through and render as text */ }
+      feedText(ev.data);
+    } else {
+      feedText(decoder.decode(new Uint8Array(ev.data), { stream: true }));
+    }
+  };
+}
+function sendInput(data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "input", data }));
+  }
+}
+function sendResize() {
+  // Approximate terminal geometry from the output area size.
+  const probe = document.createElement("span");
+  probe.textContent = "MMMMMMMMMM";
+  probe.style.visibility = "hidden";
+  out.appendChild(probe);
+  const charW = probe.getBoundingClientRect().width / 10 || 8;
+  out.removeChild(probe);
+  const cols = Math.max(20, Math.floor(out.clientWidth / charW));
+  const rows = Math.max(5, Math.floor(out.clientHeight / 19));
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "resize", rows, cols }));
+  }
+}
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(sendResize, 200);
+});
+
+// --- Session list ---------------------------------------------------------
+async function refreshSessions() {
+  try {
+    const res = await fetch("/sessions?token=" + encodeURIComponent(token));
+    if (!res.ok) return;
+    const list = await res.json();
+    const sel = document.getElementById("sessions");
+    sel.innerHTML = "";
+    for (const s of list) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = s.name + (s.alive ? "" : " (exited)");
+      if (s.id === sessionId) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  } catch (e) {}
+}
+document.getElementById("attach").onclick = () => {
+  const sel = document.getElementById("sessions");
+  if (sel.value) { sessionId = sel.value; connect(); }
+};
+document.getElementById("new").onclick = () => {
+  window.open("/?token=" + encodeURIComponent(token) + "&session=new", "_blank");
+};
+
+// --- Controls -------------------------------------------------------------
+const cmdEl = document.getElementById("cmd");
+const history = [];
+let histIdx = -1;
+function submit() {
+  const v = cmdEl.value;
+  sendInput(v + "\r");
+  if (v) { history.push(v); }
+  histIdx = history.length;
+  cmdEl.value = "";
+}
+document.getElementById("send").onclick = submit;
+cmdEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") submit();
+  else if (e.key === "ArrowUp") {
+    if (histIdx > 0) { histIdx--; cmdEl.value = history[histIdx] || ""; }
+    e.preventDefault();
+  } else if (e.key === "ArrowDown") {
+    if (histIdx < history.length) { histIdx++; cmdEl.value = history[histIdx] || ""; }
+    e.preventDefault();
+  }
+});
+document.getElementById("ctrlc").onclick = () => sendInput("\x03");
+document.getElementById("ctrld").onclick = () => sendInput("\x04");
+document.getElementById("clear").onclick = () => { out.innerHTML = ""; curLine = null; newLine(); };
+document.getElementById("reconnect").onclick = () => connect();
+document.getElementById("kill").onclick = async () => {
+  if (!sessionId) return;
+  await fetch("/sessions/" + sessionId + "?token=" + encodeURIComponent(token), { method: "DELETE" });
+  setStatus("session killed", false);
+  refreshSessions();
+};
+
+newLine();
+connect();
+refreshSessions();
+</script>
+</body>
+</html>

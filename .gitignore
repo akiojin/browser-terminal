@@ -1,0 +1,6 @@
+/target/
+*.log
+!verify.log
+config.toml
+browser-terminal.toml
+.DS_Store
