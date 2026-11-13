@@ -48,9 +48,14 @@ This tool exposes a shell. It is built to be safe by default:
 
 ### Easiest: let an AI agent do it
 
-Paste the ready-made prompt in [docs/install-prompt.md](docs/install-prompt.md)
-into the AI agent running on the target machine (Claude Code, Codex, …).
-It clones, installs, starts the server, verifies it, and reports back.
+Paste this into Claude Code, Cursor, Codex or another coding assistant:
+
+```
+Set up browser-terminal on this machine for me: https://github.com/akiojin/browser-terminal — follow docs/install-prompt.md in that repository.
+```
+
+The prompt in [docs/install-prompt.md](docs/install-prompt.md) makes the agent
+clone, install, start the server, verify it, and report back.
 
 ### Manual
 
