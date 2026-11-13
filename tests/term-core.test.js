@@ -181,5 +181,121 @@ function ok(cond, name) { eq(!!cond, true, name); }
   eq(t.lineText(1), "a", "RI shifts content down");
 }
 
+// 17. Prefixed CSI is NOT the plain sequence: CSI > 4 ; 2 m is XTMODKEYS
+// (modifyOtherKeys), not SGR -- it must not switch on underline/dim.
+{
+  const t = new TermCore(80, 24);
+  t.feed("\x1b[>4;2mX");
+  eq(t.cell(0, 0).s.underline, false, "CSI >4;2m does not set underline (XTMODKEYS)");
+  eq(t.cell(0, 0).s.dim, false, "CSI >4;2m does not set dim (XTMODKEYS)");
+  const t2 = new TermCore(80, 24);
+  t2.feed("\x1b[4mX");
+  eq(t2.cell(0, 0).s.underline, true, "plain CSI 4m still sets underline");
+}
+
+// 18. Prefixed CSI u is the Kitty keyboard protocol, not SCOR cursor restore.
+{
+  const t = new TermCore(80, 24);
+  t.feed("ab\x1b[s");            // save cursor at (2,0)
+  t.feed("\r\n\r\nXYZ");         // move away, cursor ends at (3,2)
+  const before = [t.cx, t.cy];
+  t.feed("\x1b[>5u");            // kitty: push keyboard flags
+  eq([t.cx, t.cy].join(","), before.join(","), "CSI >5u does not restore cursor (kitty push)");
+  t.feed("\x1b[<u");             // kitty: pop keyboard flags
+  eq([t.cx, t.cy].join(","), before.join(","), "CSI <u does not restore cursor (kitty pop)");
+  t.feed("\x1b[?u");             // kitty: query keyboard flags
+  eq([t.cx, t.cy].join(","), before.join(","), "CSI ?u does not restore cursor (kitty query)");
+  t.feed("\x1b[u");              // plain SCOR: restores the saved position
+  eq([t.cx, t.cy].join(","), "2,0", "plain CSI u still restores cursor");
+}
+
+// 19. DA response only for the unprefixed primary query.
+{
+  const t = new TermCore(80, 24);
+  let resp = null;
+  t.onResponse = (s) => { resp = s; };
+  t.feed("\x1b[>0c");
+  eq(resp, null, "CSI >0c (secondary DA) gets no primary DA response");
+  t.feed("\x1b[c");
+  ok(resp !== null && resp.indexOf("\x1b[?") === 0, "plain CSI c still answers primary DA");
+}
+
+// --- Real-stream fixtures (recorded with script(1) / tmux pipe-pane) --------
+// lessHosts:   GNU less 590 painting /etc/hosts (16 lines) at 177x40,
+//              TERM=xterm-256color, full session including quit.
+// lessRepaint: GNU less 590 on a 3-line file at 60x12, with a Ctrl-L repaint
+//              (the repaint emits the "~" past-EOF filler lines).
+// claudeBoot:  Claude Code 2.1.323 first-run screen inside tmux at 177x40.
+const FIXTURES = {
+  lessHosts: "G1s/MTA0OWgbWzIyOzA7MHQbWz8xaBs9DSMgTWFuYWdlZCBieSBzcGF3bmQuIFN0YXRpYyBydW50aW1lLWNlbGwgL2V0Yy9ob3N0cywgcmVuZGVyZWQgZnJvbSBpbnN0YWxsLXRpbWUNCiMgY29uc3RhbnRzIGFuZCBiaW5kLW1vdW50ZWQgcmVhZC1vbmx5IGludG8gdGhlIGNlbGwgKGFuZCBwcml2c2VwIHdvcmtlcnMpLg0KIyBUaGlzIGZpbGUgaXMgYXV0aG9yaXRhdGl2ZSBhbmQgY29tcGxldGU6IGl0IGlzIE5PVCBtZXJnZWQgd2l0aCBhbnkgaW5oZXJpdGVkDQojIHJvb3RmcyBlbnRyeS4gQWxsIHZhbHVlcyBhcmUgc3RhdGljIHJlbmRlciBjb25zdGFudHMsIHNvIHRoZSBjb250ZW50IGlzIHN0YWJsZQ0KIyBhY3Jvc3MgYm9vdHMgYW5kIGlkZW50aWNhbCBvbiBldmVyeSBWTSBvZiBhIGdpdmVuIGltYWdlLg0KMTI3LjAuMC4xIGxvY2FsaG9zdA0KOjoxIGxvY2FsaG9zdCBpcDYtbG9jYWxob3N0IGlwNi1sb29wYmFjaw0KIyBNYXAgdGhlIGNlbGwncyBvd24gaG9zdG5hbWUgdG8gbG9vcGJhY2sgaW4gYm90aCBmYW1pbGllcyBzbyBzdWRvL3N5c3RlbWN0bA0KIyBob3N0bmFtZSBjYW5vbmljYWxpemF0aW9uIHJlc29sdmVzIHZpYSBOU1MgZmlsZXMgaW5zdGVhZCBvZiBzdGFsbGluZyB+MzBzIG9uIGENCiMgRE5TIHF1ZXJ5IHRvIHRoZSBlZ3Jlc3MgZ2F0ZXdheSwgd2hpY2ggY2Fubm90IHJlc29sdmUgdGhlIGludGVybmFsIG1hY2hpbmUgbmFtZS4NCjEyNy4wLjEuMSBodGNoLXJ1bnRpbWUNCjo6MSBodGNoLXJ1bnRpbWUNCiMgRWdyZXNzIHByb3h5IGFsaWFzZXMuIFRoZSBjZWxsIChhbmQgR1dTIHByaXZzZXAgd29ya2VycyB0aGF0IGluaGVyaXQgdGhlIGNlbGwNCiMgcHJveHkgZW52KSByZXNvbHZlIGhhdGNoLWVncmVzcy1wcm94eSB0byB0aGUgdmV0aCBnYXRld2F5IGFkZHJlc3MuDQoxOTguMTkuMC4xIGhhdGNoLWVncmVzcy1wcm94eQ0KZmQ4Yjo0Zjg0OjdkMzI6OTk6OjEgaGF0Y2gtZWdyZXNzLXByb3h5DQobWzdtL2V0Yy9ob3N0cyAoRU5EKRtbMjdtG1tLDRtbSxtbPzFsGz4bWz8xMDQ5bBtbMjM7MDswdAo=",
+  lessRepaint: "G1s/MTA0OWgbWzIyOzA7MHQbWz8xaBs9DWFscGhhDQpiZXRhDQpnYW1tYQ0KG1s3bXRpbnkudHh0IChFTkQpG1syN20bW0sNG1tLLi4uc2tpcHBpbmcuLi4NCmFscGhhDQpiZXRhDQpnYW1tYQ0KG1sxbX4bWzBtDQobWzFtfhtbMG0NChtbMW1+G1swbQ0KG1sxbX4bWzBtDQobWzFtfhtbMG0NChtbMW1+G1swbQ0KG1sxbX4bWzBtDQobWzFtfhtbMG0NChtbN20oRU5EKRtbMjdtG1tLDRtbSxtbPzFsGz4bWz8xMDQ5bBtbMjM7MDswdAo=",
+  claudeBoot: "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4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWM4pWMG1szOW0NDQobWzJHG1szODs1OzIzMW0bWzJtIDEbWzVHG1syMm0gG1szODs1OzgxbWZ1bmN0aW9uG1szODs1OzIzMW0gG1szODs1OzE0OG1ncmVldBtbMzg7NTsyMzFtKCkbWzIzR3sbWzM5bQ0NChtbMkcbWzM4OzU7MTY3bRtbNDg7NTs1Mm0gMiAtG1szODs1OzIzMW0gIGNvbnNvbGUubG9nKCJIZWxsbywgV29ybGQhIik7ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIBtbMzltG1s0OW0NDQobWzJHG1szODs1Ozc3bRtbNDg7NTsyMm0gMiArG1szODs1OzIzMW0gIGNvbnNvbGUuG1szODs1OzE0OG1sb2cbWzM4OzU7MjMxbSgbWzM4OzU7MTg2bSJIZWxsbywgG1s0ODs1OzI4bUNsYXVkZRtbNDg7NTsyMm0hIhtbMzg7NTsyMzFtKTsgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAbWzM5bRtbNDltDQ0KG1syRxtbMzg7NTsyMzFtG1sybSAzG1s1RxtbMjJtIH0bWzM5bQ0NChtbMkcbWzM4OzU7MjM5beKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjOKVjBtbMzltDQ0KG1syRxtbMzg7NTsyNDZtIFN5bnRheBtbMTBHdGhlbWU6G1sxN0dNb25va2FpG1syNUdFeHRlbmRlZBtbMzRHKGN0cmwrdBtbNDJHdG8bWzQ1R2Rpc2FibGUpG1szOW0NDQobWzFDG1sxNEE=",
+};
+function fixture(name) { return Buffer.from(FIXTURES[name], "base64").toString("utf8"); }
+function splitAfter(s, marker) { // [through marker, rest]
+  const i = s.indexOf(marker);
+  return i < 0 ? [s, ""] : [s.slice(0, i + marker.length), s.slice(i + marker.length)];
+}
+
+// 20. Real less stream: content is painted from row 0 in the alt screen and
+// leaving less restores the main screen.
+{
+  const t = new TermCore(177, 40);
+  t.feed("user@mac ~ % less /etc/hosts\r\n");
+  const stream = fixture("lessHosts");
+  const [active, quit] = splitAfter(stream, "/etc/hosts (END)\x1b[27m");
+  t.feed(active);
+  eq(t.altActive, true, "less: alt screen active while running");
+  ok(t.lineText(0).indexOf("# Managed by spawnd") === 0, "less: content starts at row 0");
+  ok(t.lineText(5).indexOf("127.0.0.1 localhost") === 0, "less: hosts entry on row 5");
+  ok(t.lineText(15).indexOf("fd8b:4f84:7d32:99::1 hatch-egress-proxy") === 0, "less: last hosts line on row 15");
+  ok(t.lineText(16).indexOf("/etc/hosts (END)") === 0, "less: (END) status on row 16");
+  eq(t.cell(0, 16).s.reverse, true, "less: (END) status is reverse video");
+  t.feed(quit);
+  eq(t.altActive, false, "less: alt screen left after quit");
+  ok(t.lineText(0).indexOf("user@mac ~ % less /etc/hosts") === 0, "less: main screen restored after quit");
+}
+
+// 21. Real less repaint (Ctrl-L): the repaint repaints the whole screen by
+// scrolling; the final grid is content rows, bold "~" filler rows, then the
+// (END) status on the last row.
+{
+  const t = new TermCore(60, 12);
+  const stream = fixture("lessRepaint");
+  // The first paint's status also contains "(END)"; cut after the LAST one,
+  // which ends the Ctrl-L repaint (the quit tail that follows is not fed).
+  const i = stream.lastIndexOf("(END)\x1b[27m");
+  t.feed(stream.slice(0, i + "(END)\x1b[27m".length));
+  eq(t.altActive, true, "less repaint: alt screen active");
+  eq(t.lineText(0), "alpha", "less repaint: row 0 is first content line");
+  eq(t.lineText(1), "beta", "less repaint: row 1");
+  eq(t.lineText(2), "gamma", "less repaint: row 2");
+  eq(t.lineText(3), "~", "less repaint: tilde filler starts at row 3");
+  eq(t.lineText(10), "~", "less repaint: tilde filler reaches row 10");
+  eq(t.cell(0, 3).s.bold, true, "less repaint: tildes are bold");
+  eq(t.lineText(11), "(END)", "less repaint: (END) on the last row");
+  eq(t.cell(0, 11).s.reverse, true, "less repaint: (END) is reverse video");
+}
+
+// 22. Real Claude Code 2.1.323 boot stream: words are placed with CHA and the
+// frame must not collapse or pick up stray attributes from prefixed CSI
+// (XTMODKEYS CSI >4;2m, kitty keyboard CSI >5u / <u / ?u).
+{
+  const t = new TermCore(177, 40);
+  t.feed(fixture("claudeBoot"));
+  const rows = [];
+  for (let y = 0; y < 40; y++) rows.push(t.lineText(y));
+  const rowOf = (text) => rows.findIndex(r => r.indexOf(text) >= 0);
+  eq(rows[1], "Welcome to Claude Code v2.1.323", "claude: banner intact on row 1 (no overwrite interleave)");
+  eq(t.cell(0, 1).s.underline, false, "claude: banner not underlined by XTMODKEYS mis-parse");
+  eq(t.cell(0, 1).s.dim, false, "claude: banner not dimmed by XTMODKEYS mis-parse");
+  ok(rowOf("Let's get started.") > 1, "claude: 'Let's get started.' on its own row below the banner");
+  ok(rowOf("Choose the text style") > rowOf("Let's get started."), "claude: theme prompt below greeting");
+  ok(rowOf("Dark mode") > rowOf("Choose the text style"), "claude: theme options below prompt");
+  ok(rowOf("function greet()") > rowOf("Dark mode"), "claude: preview code below options");
+  ok(rowOf("Syntax theme:") > rowOf("function greet()"), "claude: syntax theme line below preview");
+  ok(rowOf("Syntax theme:") >= 20, "claude: frame keeps full height (no vertical collapse)");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

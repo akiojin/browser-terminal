@@ -442,8 +442,17 @@ class TermCore {
         break;
       }
       case "s": this.saved = this.saveCursor(); break;
-      case "u": this.restoreCursor(this.saved); break;
-      case "m": this.applySgr(raw === "" ? [] : parts.map(p => { const n = parseInt(p, 10); return isNaN(n) ? 0 : n; })); break;
+      case "u": { // SCOR (restore cursor) is the UNPREFIXED form only. Prefixed
+        // CSI u (>, <, =, ?) is the Kitty keyboard protocol (push/pop/query
+        // enhancement flags) and must not move the cursor.
+        if (prefix === "") this.restoreCursor(this.saved); break;
+      }
+      case "m": { // SGR is the UNPREFIXED form only. CSI > ... m is XTMODKEYS
+        // (modifyOtherKeys) and CSI ? ... m is a private mode report; neither
+        // changes rendition.
+        if (prefix === "") this.applySgr(raw === "" ? [] : parts.map(p => { const n = parseInt(p, 10); return isNaN(n) ? 0 : n; }));
+        break;
+      }
       case "h": case "l": {
         const set = finalB === "h";
         if (priv) {
@@ -463,8 +472,9 @@ class TermCore {
         }
         break;
       }
-      case "c": { // primary DA
-        if (this.onResponse && (raw === "" || nums[0] === 0)) this.onResponse("\x1b[?62c");
+      case "c": { // primary DA: answer the UNPREFIXED query only. CSI > c is
+        // the secondary DA query and must not get a primary response.
+        if (this.onResponse && prefix === "" && (raw === "" || nums[0] === 0)) this.onResponse("\x1b[?62c");
         break;
       }
       case "n": { // device status report

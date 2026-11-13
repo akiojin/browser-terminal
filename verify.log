@@ -129,3 +129,27 @@ Environment: Linux (x86_64 VM), Node v24.22.1, npm 10.9.4.
     UNIT TESTS PASSED.
 
 RESULT: ALL CHECKS PASSED.
+
+9. TermCore prefixed-CSI fix (2026-11-13): real-stream captures (GNU less
+   590 via script(1); Claude Code 2.1.323 via tmux pipe-pane, 177x40)
+   showed TermCore misreading PREFIXED CSI sequences as their unprefixed
+   forms:
+   - CSI > 4 ; 2 m (XTMODKEYS modifyOtherKeys) was applied as SGR, turning
+     underline+dim on for all following output (the "underlined screen"
+     seen with Claude Code on the 6th).
+   - CSI > 5 u / CSI < u / CSI ? u (Kitty keyboard protocol push/pop/
+     query) was treated as SCOR cursor restore, yanking the cursor to a
+     stale saved position mid-frame and scrambling the layout (banner
+     overwritten by later text; frames desynced).
+   - CSI > 0 c (secondary DA) was answered with a primary DA response.
+   Fix (src/ui.html, TermCore.doCsi only): SGR, cursor restore and the DA
+   response now apply only when the CSI has no prefix byte.
+   Tests (tests/term-core.test.js): unit cases for the three prefixes plus
+   three recorded-stream fixtures embedded as base64 -- less painting
+   /etc/hosts at 177x40 (content from row 0, reverse-video "(END)" status,
+   main screen restored on quit), less Ctrl-L repaint at 60x12 (content
+   rows, bold "~" filler rows, "(END)" on the last row), and the Claude
+   Code 2.1.323 boot stream (banner intact, no stray underline/dim, frame
+   keeps full height). Full suite: ALL UNIT TESTS PASSED (70 checks).
+
+RESULT: ALL CHECKS PASSED.
