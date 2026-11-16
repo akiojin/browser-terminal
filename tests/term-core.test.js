@@ -311,5 +311,23 @@ function splitAfter(s, marker) { // [through marker, rest]
   ok(rowOf("Syntax theme:") >= 20, "claude: frame keeps full height (no vertical collapse)");
 }
 
+// 23. Paste payload shaping: newline normalization and bracketed paste.
+{
+  const t = new TermCore(80, 24);
+  eq(t.pastePayload("ls -la"), "ls -la", "paste: plain single line unchanged");
+  eq(t.pastePayload("echo a\necho b"), "echo a\recho b", "paste: LF becomes CR without bracketed paste");
+  eq(t.pastePayload("echo a\r\necho b"), "echo a\recho b", "paste: CRLF normalized to one CR");
+  eq(t.pastePayload("echo a\recho b"), "echo a\recho b", "paste: lone CR treated as newline");
+  eq(t.pastePayload("make test\n"), "make test\r", "paste: trailing newline kept (runs the command)");
+  eq(t.pastePayload(""), "", "paste: empty text stays empty");
+  t.feed("\x1b[?2004h");
+  eq(t.bracketedPaste, true, "paste: DECSET 2004 tracked");
+  eq(t.pastePayload("echo a\necho b"), "\x1b[200~echo a\necho b\x1b[201~", "paste: bracketed paste wraps, LF kept inside");
+  eq(t.pastePayload("echo a\r\necho b"), "\x1b[200~echo a\necho b\x1b[201~", "paste: bracketed paste normalizes CRLF to LF");
+  eq(t.pastePayload("a\x1b[201~b"), "\x1b[200~ab\x1b[201~", "paste: embedded end marker stripped");
+  t.feed("\x1b[?2004l");
+  eq(t.pastePayload("echo a\necho b"), "echo a\recho b", "paste: DECRST 2004 restores plain payload");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

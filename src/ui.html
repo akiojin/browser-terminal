@@ -50,6 +50,7 @@
   <button id="clear">Clear</button>
   <button id="copyscreen" title="Copy the visible screen text to the clipboard">Copy screen</button>
   <button id="shot" title="Download the visible screen as a PNG image">Screenshot</button>
+  <button id="paste" title="Paste clipboard text into the terminal">Paste</button>
   <button id="reconnect">Reconnect</button>
   <button id="kill">Kill session</button>
 </header>
@@ -197,6 +198,15 @@ class TermCore {
                                               : this.lineText(idx - this.scrollback.length));
     }
     return lines.join("\n");
+  }
+  pastePayload(text) { // exact string to send to the PTY for a clipboard paste
+    let t = String(text == null ? "" : text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (this.bracketedPaste) {
+      // An embedded end marker must not terminate the paste early.
+      t = t.split("\x1b[201~").join("");
+      return "\x1b[200~" + t + "\x1b[201~"; // newlines stay LF inside the markers
+    }
+    return t.replace(/\n/g, "\r"); // no bracketed paste: CR submits each line
   }
 
   resize(cols, rows) {
@@ -824,6 +834,13 @@ ime.addEventListener("keydown", (e) => {
     if (t && navigator.clipboard) navigator.clipboard.writeText(t).catch(() => {});
     e.preventDefault(); return;
   }
+  // Paste shortcuts: Cmd/Ctrl+V must reach the browser so the paste event
+  // fires (the paste handler below forwards the clipboard text). Converting
+  // it to ^V here and preventDefault()-ing would swallow the paste entirely.
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === "v" || e.key === "V")) {
+    if (e.shiftKey) { e.preventDefault(); pasteFromClipboard(); }
+    return;
+  }
   // View scrolling (not sent to the PTY).
   if (e.shiftKey && e.key === "PageUp") { viewOffset = Math.min(term.scrollback.length, viewOffset + term.rows); requestRender(); e.preventDefault(); return; }
   if (e.shiftKey && e.key === "PageDown") { viewOffset = Math.max(0, viewOffset - term.rows); requestRender(); e.preventDefault(); return; }
@@ -845,13 +862,37 @@ ime.addEventListener("compositionend", (e) => {
   if (e.data) sendInput(e.data);
   ime.value = "";
 });
-ime.addEventListener("paste", (e) => {
-  e.preventDefault();
-  const text = (e.clipboardData || window.clipboardData).getData("text");
+function pasteIntoTerminal(text) {
   if (!text) return;
-  const norm = text.replace(/\r\n/g, "\n").replace(/\n/g, "\r");
-  if (term.bracketedPaste) sendInput("\x1b[200~" + norm.replace(/\r/g, "\n") + "\x1b[201~");
-  else sendInput(norm);
+  sendInput(term.pastePayload(text));
+  if (viewOffset !== 0) { viewOffset = 0; requestRender(); }
+  ime.focus({ preventScroll: true });
+}
+async function pasteFromClipboard() { // Paste button / Ctrl+Shift+V path
+  const btn = document.getElementById("paste");
+  let text = "";
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.readText) throw new Error("clipboard API unavailable");
+    text = await navigator.clipboard.readText();
+  } catch (err) {
+    if (btn) flashLabel(btn, "Paste failed");
+    ime.focus({ preventScroll: true });
+    return;
+  }
+  if (text) { pasteIntoTerminal(text); if (btn) flashLabel(btn, "Pasted"); }
+  else ime.focus({ preventScroll: true });
+}
+ime.addEventListener("paste", (e) => {
+  e.preventDefault(); // keep the text out of the textarea (no double send)
+  const text = (e.clipboardData || window.clipboardData).getData("text");
+  pasteIntoTerminal(text);
+});
+document.addEventListener("paste", (e) => {
+  // The ime listener above handles pastes aimed at the input field; this
+  // catches pastes while focus sits on a toolbar control or the page body.
+  if (e.target === ime) return;
+  const text = (e.clipboardData || window.clipboardData).getData("text");
+  if (text) { e.preventDefault(); pasteIntoTerminal(text); }
 });
 document.addEventListener("copy", () => {
   // After a copy, clear the selection so the next Ctrl-C is SIGINT again.
@@ -895,6 +936,7 @@ document.getElementById("new").onclick = () => {
 document.getElementById("ctrlc").onclick = () => { sendInput("\x03"); ime.focus({ preventScroll: true }); };
 document.getElementById("ctrld").onclick = () => { sendInput("\x04"); ime.focus({ preventScroll: true }); };
 document.getElementById("clear").onclick = () => { term.clearView(); viewOffset = 0; requestRender(); ime.focus({ preventScroll: true }); };
+document.getElementById("paste").onclick = () => { pasteFromClipboard(); };
 
 // --- Screen capture: copy visible text / save visible screen as PNG --------
 function flashLabel(btn, text) {
