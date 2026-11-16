@@ -335,7 +335,7 @@ function splitAfter(s, marker) { // [through marker, rest]
   const hEnd = html.indexOf("/* === UI-HELPERS-END === */");
   if (hBegin < 0 || hEnd < 0) { console.error("FAIL: UI-HELPERS markers not found"); process.exit(1); }
   const helpers = new Function(html.slice(hBegin, hEnd) +
-    "\nreturn { clickShouldFocusIme, screenshotFileName, canShareScreenshot, shareFallbackAction };")();
+    "\nreturn { clickShouldFocusIme, screenshotFileName, canShareScreenshot, shareFallbackAction, formatSessionError, errorBarAfterEvent };")();
   eq(helpers.clickShouldFocusIme(""), true, "ui: plain click (no selection) focuses IME");
   eq(helpers.clickShouldFocusIme("selected text"), false, "ui: click ending a drag selection keeps the selection");
   eq(helpers.screenshotFileName(new Date("2026-11-16T16:06:27.891Z")), "browser-terminal-2026-11-16T16-06-27.png",
@@ -353,6 +353,36 @@ function splitAfter(s, marker) { // [through marker, rest]
   eq(helpers.shareFallbackAction({ name: "AbortError" }), "ignore", "ui: share cancel -> do nothing");
   eq(helpers.shareFallbackAction({ name: "NotAllowedError" }), "download", "ui: other share error -> download");
   eq(helpers.shareFallbackAction(null), "download", "ui: unknown share error -> download");
+}
+
+// 25. UI helpers: the session error bar keeps the last creation failure
+// visible across the socket close and clears it on the next success.
+{
+  const hBegin = html.indexOf("/* === UI-HELPERS-BEGIN === */");
+  const hEnd = html.indexOf("/* === UI-HELPERS-END === */");
+  const helpers = new Function(html.slice(hBegin, hEnd) +
+    "\nreturn { formatSessionError, errorBarAfterEvent };")();
+  eq(helpers.formatSessionError("spawn shell failed: posix_spawnp failed."),
+     "Failed to start session: spawn shell failed: posix_spawnp failed.",
+     "errbar: server message is prefixed for display");
+  eq(helpers.formatSessionError(""), "Failed to start session", "errbar: empty message still names the failure");
+  eq(helpers.formatSessionError(undefined), "Failed to start session", "errbar: missing message still names the failure");
+  eq(helpers.formatSessionError("  no such session  "), "Failed to start session: no such session",
+     "errbar: message is trimmed");
+
+  let text = "";
+  text = helpers.errorBarAfterEvent(text, { type: "error", message: "spawn shell failed: posix_spawnp failed." });
+  eq(text, "Failed to start session: spawn shell failed: posix_spawnp failed.", "errbar: error event sets the text");
+  text = helpers.errorBarAfterEvent(text, { type: "close" });
+  ok(text.length > 0, "errbar: socket close does NOT clear the error");
+  text = helpers.errorBarAfterEvent(text, { type: "open" });
+  ok(text.length > 0, "errbar: socket open does NOT clear the error");
+  text = helpers.errorBarAfterEvent(text, { type: "error", message: "no such session" });
+  eq(text, "Failed to start session: no such session", "errbar: a newer error replaces the older one");
+  text = helpers.errorBarAfterEvent(text, { type: "session", id: "abcd1234", name: "shell-1", alive: true });
+  eq(text, "", "errbar: a successful session clears the error");
+  eq(helpers.errorBarAfterEvent("", null), "", "errbar: null event keeps empty state");
+  eq(helpers.errorBarAfterEvent("x", {}), "x", "errbar: typeless event keeps current text");
 }
 
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
