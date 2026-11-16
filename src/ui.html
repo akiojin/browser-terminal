@@ -49,7 +49,7 @@
   <button id="ctrld" title="Send Ctrl-D (EOF)">Ctrl-D</button>
   <button id="clear">Clear</button>
   <button id="copyscreen" title="Copy the visible screen text to the clipboard">Copy screen</button>
-  <button id="shot" title="Download the visible screen as a PNG image">Screenshot</button>
+  <button id="shot" title="Share or save the visible screen as a PNG image">Screenshot</button>
   <button id="paste" title="Paste clipboard text into the terminal">Paste</button>
   <button id="reconnect">Reconnect</button>
   <button id="kill">Kill session</button>
@@ -594,6 +594,19 @@ function clickShouldFocusIme(selText) {
   // (no live selection) should move focus for typing.
   return !selText;
 }
+function screenshotFileName(date) {
+  return "browser-terminal-" + date.toISOString().replace(/[:.]/g, "-").slice(0, 19) + ".png";
+}
+function canShareScreenshot(nav, file) {
+  // Web Share Level 2 (files) availability; anything odd counts as no.
+  if (!nav || typeof nav.share !== "function" || typeof nav.canShare !== "function") return false;
+  try { return !!nav.canShare({ files: [file] }); } catch (e) { return false; }
+}
+function shareFallbackAction(err) {
+  // After navigator.share() rejects: a user cancel (AbortError) means do
+  // nothing at all; any other failure falls back to the PNG download.
+  return err && err.name === "AbortError" ? "ignore" : "download";
+}
 /* === UI-HELPERS-END === */
 
 // --- token handling -------------------------------------------------------
@@ -1030,15 +1043,30 @@ function screenToCanvas() { // redraw the visible window from the cell grid
   }
   return cv;
 }
+function downloadPng(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
 document.getElementById("shot").onclick = (ev) => {
   const btn = ev.currentTarget;
-  screenToCanvas().toBlob((blob) => {
+  screenToCanvas().toBlob(async (blob) => {
     if (!blob) { flashLabel(btn, "Failed"); return; }
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "browser-terminal-" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19) + ".png";
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    const name = screenshotFileName(new Date());
+    const file = new File([blob], name, { type: "image/png" });
+    if (canShareScreenshot(navigator, file)) {
+      try {
+        await navigator.share({ files: [file] });
+        flashLabel(btn, "Shared");
+        return;
+      } catch (err) {
+        if (shareFallbackAction(err) === "ignore") return; // share sheet cancelled
+        // Any other share failure falls through to the download below.
+      }
+    }
+    downloadPng(blob, name);
     flashLabel(btn, "Saved");
   }, "image/png");
   ime.focus({ preventScroll: true });

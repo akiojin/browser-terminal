@@ -335,9 +335,24 @@ function splitAfter(s, marker) { // [through marker, rest]
   const hEnd = html.indexOf("/* === UI-HELPERS-END === */");
   if (hBegin < 0 || hEnd < 0) { console.error("FAIL: UI-HELPERS markers not found"); process.exit(1); }
   const helpers = new Function(html.slice(hBegin, hEnd) +
-    "\nreturn { clickShouldFocusIme };")();
+    "\nreturn { clickShouldFocusIme, screenshotFileName, canShareScreenshot, shareFallbackAction };")();
   eq(helpers.clickShouldFocusIme(""), true, "ui: plain click (no selection) focuses IME");
   eq(helpers.clickShouldFocusIme("selected text"), false, "ui: click ending a drag selection keeps the selection");
+  eq(helpers.screenshotFileName(new Date("2026-11-16T16:06:27.891Z")), "browser-terminal-2026-11-16T16-06-27.png",
+     "ui: screenshot file name format");
+  const fakeFile = { name: "x.png", type: "image/png" };
+  eq(helpers.canShareScreenshot(null, fakeFile), false, "ui: no navigator -> no share");
+  eq(helpers.canShareScreenshot({}, fakeFile), false, "ui: share API missing -> no share");
+  eq(helpers.canShareScreenshot({ share() {} }, fakeFile), false, "ui: canShare missing -> no share");
+  eq(helpers.canShareScreenshot({ share() {}, canShare: () => false }, fakeFile), false,
+     "ui: canShare false for files -> no share");
+  eq(helpers.canShareScreenshot({ share() {}, canShare: () => true }, fakeFile), true,
+     "ui: canShare true for files -> share");
+  eq(helpers.canShareScreenshot({ share() {}, canShare() { throw new Error("x"); } }, fakeFile), false,
+     "ui: canShare throwing -> no share");
+  eq(helpers.shareFallbackAction({ name: "AbortError" }), "ignore", "ui: share cancel -> do nothing");
+  eq(helpers.shareFallbackAction({ name: "NotAllowedError" }), "download", "ui: other share error -> download");
+  eq(helpers.shareFallbackAction(null), "download", "ui: unknown share error -> download");
 }
 
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
