@@ -18,6 +18,7 @@ const { execFileSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const pty = require('node-pty');
 const { parse: parseToml } = require('smol-toml');
+const { repairNodePtySpawnHelpers, probePtySpawn } = require('./spawn-helper');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -629,6 +630,24 @@ function main() {
   }
   CONFIG = loaded.cfg;
   CONFIG_DIR = loaded.dir;
+
+  // node-pty's prebuilt spawn-helper can land without execute bits
+  // (npm install artifact); every session spawn then fails with
+  // "posix_spawnp failed.". Repair the bits before the first spawn and
+  // run a one-shot spawn self-check so a broken install is loud in the
+  // startup log instead of silent in the UI. See src/spawn-helper.js.
+  repairNodePtySpawnHelpers((line) => console.log(line));
+  const probe = probePtySpawn();
+  if (!probe.skipped) {
+    if (probe.ok) {
+      console.log('pty spawn self-check: ok');
+    } else {
+      console.error(
+        `pty spawn self-check FAILED: ${probe.error} — sessions will fail to start; ` +
+          'check the spawn-helper permissions under node_modules/node-pty/prebuilds'
+      );
+    }
+  }
 
   UI_HTML = fs.readFileSync(path.join(__dirname, 'ui.html'), 'utf8');
 
