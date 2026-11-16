@@ -584,6 +584,18 @@ class TermCore {
 }
 /* === TERM-CORE-END === */
 
+/* === UI-HELPERS-BEGIN === */
+// Pure UI decision helpers: no DOM access, so tests can extract and run
+// them under Node (same pattern as TermCore above).
+function clickShouldFocusIme(selText) {
+  // A click that ends a drag selection must NOT focus the IME textarea:
+  // focusing it moves the caret into the textarea and collapses the text
+  // selection the user just made in the terminal view. Only a plain click
+  // (no live selection) should move focus for typing.
+  return !selText;
+}
+/* === UI-HELPERS-END === */
+
 // --- token handling -------------------------------------------------------
 const params = new URLSearchParams(location.search);
 let token = params.get("token") || sessionStorage.getItem("bt_token") || "";
@@ -783,7 +795,14 @@ if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { co
 
 // --- input: direct typing on the terminal area -------------------------------
 let composing = false;
-termwrap.addEventListener("click", () => ime.focus({ preventScroll: true }));
+termwrap.addEventListener("click", () => {
+  // Drag-selecting terminal text also ends in a click on this wrapper.
+  // Focusing the IME textarea here would collapse that selection (the caret
+  // moves into the textarea), so keep hands off while a selection is live:
+  // Cmd/Ctrl+C copies it natively, and the next plain click refocuses.
+  if (!clickShouldFocusIme(selectionText())) return;
+  ime.focus({ preventScroll: true });
+});
 ime.addEventListener("focus", () => termwrap.classList.add("focused"));
 ime.addEventListener("blur", () => termwrap.classList.remove("focused"));
 

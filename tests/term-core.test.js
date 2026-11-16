@@ -329,5 +329,16 @@ function splitAfter(s, marker) { // [through marker, rest]
   eq(t.pastePayload("echo a\necho b"), "echo a\recho b", "paste: DECRST 2004 restores plain payload");
 }
 
+// 24. UI helpers: click-to-focus decision for drag selection.
+{
+  const hBegin = html.indexOf("/* === UI-HELPERS-BEGIN === */");
+  const hEnd = html.indexOf("/* === UI-HELPERS-END === */");
+  if (hBegin < 0 || hEnd < 0) { console.error("FAIL: UI-HELPERS markers not found"); process.exit(1); }
+  const helpers = new Function(html.slice(hBegin, hEnd) +
+    "\nreturn { clickShouldFocusIme };")();
+  eq(helpers.clickShouldFocusIme(""), true, "ui: plain click (no selection) focuses IME");
+  eq(helpers.clickShouldFocusIme("selected text"), false, "ui: click ending a drag selection keeps the selection");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);
