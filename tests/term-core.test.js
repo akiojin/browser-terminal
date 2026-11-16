@@ -220,6 +220,20 @@ function ok(cond, name) { eq(!!cond, true, name); }
   ok(resp !== null && resp.indexOf("\x1b[?") === 0, "plain CSI c still answers primary DA");
 }
 
+// 23. visibleText: the window the UI shows at a scroll offset (Copy screen)
+{
+  const t = new TermCore(10, 3);
+  t.feed("l1\r\nl2\r\nl3\r\nl4\r\nl5");
+  eq(t.visibleText(0), "l3\nl4\nl5", "visibleText(0) is the live screen");
+  eq(t.visibleText(0), t.screenText(), "visibleText(0) matches screenText");
+  eq(t.visibleText(1), "l2\nl3\nl4", "visibleText(1) scrolls one line back");
+  eq(t.visibleText(2), "l1\nl2\nl3", "visibleText(2) reaches the scrollback top");
+  eq(t.visibleText(99), "l1\nl2\nl3", "visibleText clamps past the scrollback top");
+  const t2 = new TermCore(10, 3);
+  t2.feed("only");
+  eq(t2.visibleText(0), "only\n\n", "visibleText keeps blank rows on a short screen");
+}
+
 // --- Real-stream fixtures (recorded with script(1) / tmux pipe-pane) --------
 // lessHosts:   GNU less 590 painting /etc/hosts (16 lines) at 177x40,
 //              TERM=xterm-256color, full session including quit.

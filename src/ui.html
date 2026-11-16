@@ -48,6 +48,8 @@
   <button id="ctrlc" title="Send Ctrl-C">Ctrl-C</button>
   <button id="ctrld" title="Send Ctrl-D (EOF)">Ctrl-D</button>
   <button id="clear">Clear</button>
+  <button id="copyscreen" title="Copy the visible screen text to the clipboard">Copy screen</button>
+  <button id="shot" title="Download the visible screen as a PNG image">Screenshot</button>
   <button id="reconnect">Reconnect</button>
   <button id="kill">Kill session</button>
 </header>
@@ -185,6 +187,17 @@ class TermCore {
     return lines.join("\n");
   }
   scrollbackText() { return this.scrollback.map(r => this.rowText(r)).join("\n"); }
+  visibleText(viewOffset) { // text of the window shown at this scroll offset (0 = live)
+    const off = Math.max(0, Math.min(viewOffset | 0, this.scrollback.length));
+    const base = this.scrollback.length - off;
+    const lines = [];
+    for (let y = 0; y < this.rows; y++) {
+      const idx = base + y;
+      lines.push(idx < this.scrollback.length ? this.rowText(this.scrollback[idx])
+                                              : this.lineText(idx - this.scrollback.length));
+    }
+    return lines.join("\n");
+  }
 
   resize(cols, rows) {
     cols = Math.max(2, cols | 0); rows = Math.max(1, rows | 0);
@@ -882,6 +895,93 @@ document.getElementById("new").onclick = () => {
 document.getElementById("ctrlc").onclick = () => { sendInput("\x03"); ime.focus({ preventScroll: true }); };
 document.getElementById("ctrld").onclick = () => { sendInput("\x04"); ime.focus({ preventScroll: true }); };
 document.getElementById("clear").onclick = () => { term.clearView(); viewOffset = 0; requestRender(); ime.focus({ preventScroll: true }); };
+
+// --- Screen capture: copy visible text / save visible screen as PNG --------
+function flashLabel(btn, text) {
+  const orig = btn.textContent;
+  btn.textContent = text;
+  setTimeout(() => { btn.textContent = orig; }, 1200);
+}
+async function copyPlainText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try { await navigator.clipboard.writeText(text); return true; } catch (e) { /* fall through */ }
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.cssText = "position:fixed;opacity:0;pointer-events:none;";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) {}
+  ta.remove();
+  return ok;
+}
+document.getElementById("copyscreen").onclick = async (ev) => {
+  const btn = ev.currentTarget;
+  const ok = await copyPlainText(term.visibleText(viewOffset));
+  flashLabel(btn, ok ? "Copied" : "Copy failed");
+  ime.focus({ preventScroll: true });
+};
+function cellPaint(cell) { // effective {fg, bg} for canvas, mirroring spanCss
+  const s = cell.s;
+  let fg = colorCss(s.fg, s.bold), bg = colorCss(s.bg, false);
+  if (s.reverse) { const t = fg; fg = bg; bg = t; if (fg === null) fg = "#0c0c0c"; if (bg === null) bg = "#d4d4d4"; }
+  return { fg: fg || "#d4d4d4", bg: bg || "#0c0c0c" };
+}
+function screenToCanvas() { // redraw the visible window from the cell grid
+  const cs = getComputedStyle(termEl);
+  const padL = parseFloat(cs.paddingLeft) || 0, padR = parseFloat(cs.paddingRight) || 0;
+  const padT = parseFloat(cs.paddingTop) || 0, padB = parseFloat(cs.paddingBottom) || 0;
+  const fontSize = parseFloat(cs.fontSize) || 14;
+  const fontFamily = cs.fontFamily || "monospace";
+  const scale = Math.min(2, window.devicePixelRatio || 1);
+  const wCss = padL + padR + term.cols * charW, hCss = padT + padB + term.rows * lineH;
+  const cv = document.createElement("canvas");
+  cv.width = Math.ceil(wCss * scale); cv.height = Math.ceil(hCss * scale);
+  const ctx = cv.getContext("2d");
+  ctx.scale(scale, scale);
+  ctx.fillStyle = "#0c0c0c";
+  ctx.fillRect(0, 0, wCss, hCss);
+  ctx.textBaseline = "middle";
+  const base = term.scrollback.length - viewOffset;
+  const showCursor = viewOffset === 0 && term.cursorVisible;
+  for (let y = 0; y < term.rows; y++) {
+    const rowArr = combinedRow(base + y);
+    const y0 = padT + y * lineH;
+    for (let x = 0; x < term.cols; x++) {
+      const cell = rowArr[x];
+      if (!cell || cell.w === 0) continue;
+      const cw = cell.w * charW, x0 = padL + x * charW;
+      const paint = cellPaint(cell);
+      let fg = paint.fg, bg = paint.bg;
+      if (showCursor && y === term.cy && x === term.cx) { fg = "#0c0c0c"; bg = "#d4d4d4"; }
+      if (bg !== "#0c0c0c") { ctx.fillStyle = bg; ctx.fillRect(x0, y0, cw, lineH); }
+      if (cell.t && cell.t !== " ") {
+        ctx.font = (cell.s.italic ? "italic " : "") + (cell.s.bold ? "bold " : "") + fontSize + "px " + fontFamily;
+        ctx.globalAlpha = cell.s.dim ? 0.6 : 1;
+        ctx.fillStyle = fg;
+        ctx.fillText(cell.t, x0, y0 + lineH / 2);
+        ctx.globalAlpha = 1;
+        if (cell.s.underline) ctx.fillRect(x0, y0 + lineH - 2.5, cw, 1);
+        if (cell.s.strike) ctx.fillRect(x0, y0 + lineH / 2, cw, 1);
+      }
+    }
+  }
+  return cv;
+}
+document.getElementById("shot").onclick = (ev) => {
+  const btn = ev.currentTarget;
+  screenToCanvas().toBlob((blob) => {
+    if (!blob) { flashLabel(btn, "Failed"); return; }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "browser-terminal-" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19) + ".png";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    flashLabel(btn, "Saved");
+  }, "image/png");
+  ime.focus({ preventScroll: true });
+};
 document.getElementById("reconnect").onclick = () => connect();
 document.getElementById("kill").onclick = async () => {
   if (!sessionId) return;
