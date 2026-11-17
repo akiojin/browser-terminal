@@ -783,6 +783,7 @@ let preeditText = "";   // IME composition (preedit) string shown at the cursor 
 const sbthumb = document.getElementById("sbthumb");
 const term = new TermCore(80, 24);
 let viewOffset = 0;       // lines scrolled back into history (0 = live)
+let wheelAcc = 0;         // sub-line wheel delta accumulated for app forwarding
 let renderQueued = false;
 let prevSbLen = 0;
 let charW = 8, lineH = 20;
@@ -1229,20 +1230,28 @@ document.addEventListener("copy", () => {
 });
 termwrap.addEventListener("wheel", (e) => {
   e.preventDefault();
-  const lines = e.deltaMode === 1 ? Math.round(e.deltaY) : Math.round(e.deltaY / lineH);
-  if (lines === 0) return;
   // When the app has mouse reporting on (full-screen TUIs such as Codex),
   // the alt screen accumulates no local scrollback, so local scrolling is a
   // no-op. Forward the wheel to the app instead, like other terminals do.
   // Clicks/selection stay local to preserve bt's copy behaviour.
   if (!e.shiftKey && term.mouseModes.size > 0) {
+    // Accumulate sub-line trackpad deltas and emit at most one wheel
+    // sequence per line of scroll (max 3 per event). Sending several
+    // sequences per event makes the app repaint its whole screen once per
+    // sequence, which reads as lag and flicker.
+    wheelAcc += e.deltaMode === 1 ? e.deltaY * lineH
+              : e.deltaMode === 2 ? e.deltaY * lineH * term.rows
+              : e.deltaY;
+    let steps = Math.trunc(wheelAcc / lineH);
+    if (steps === 0) return;
+    if (steps > 3) steps = 3; else if (steps < -3) steps = -3;
+    wheelAcc -= steps * lineH;
     const rect = termwrap.getBoundingClientRect();
     const col = Math.max(1, Math.min(term.cols, Math.floor((e.clientX - rect.left) / charW) + 1));
     const row = Math.max(1, Math.min(term.rows, Math.floor((e.clientY - rect.top) / lineH) + 1));
-    const btn = lines > 0 ? 65 : 64; // 64 = wheel up, 65 = wheel down
-    const n = Math.min(5, Math.abs(lines));
+    const btn = steps > 0 ? 65 : 64; // 64 = wheel up, 65 = wheel down
     let seq = "";
-    for (let i = 0; i < n; i++) {
+    for (let i = 0, n = Math.abs(steps); i < n; i++) {
       seq += term.mouseModes.has(1006)
         ? "\x1b[<" + btn + ";" + col + ";" + row + "M"
         : "\x1b[M" + String.fromCharCode(btn + 32, col + 32, row + 32);
@@ -1250,8 +1259,11 @@ termwrap.addEventListener("wheel", (e) => {
     if (seq) sendInput(seq);
     return;
   }
-  viewOffset = Math.max(0, Math.min(term.scrollback.length, viewOffset - lines));
-  requestRender();
+  const lines = e.deltaMode === 1 ? Math.round(e.deltaY) : Math.round(e.deltaY / lineH);
+  if (lines !== 0) {
+    viewOffset = Math.max(0, Math.min(term.scrollback.length, viewOffset - lines));
+    requestRender();
+  }
 }, { passive: false });
 
 // --- Session list -------------------------------------------------------------
