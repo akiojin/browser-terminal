@@ -55,23 +55,28 @@
   #new:hover { background: var(--accent-hover); }
   #kill:hover { background: #2b161a; border-color: #6e2b33; color: var(--err-text); }
   #termwrap { position: relative; flex: 1; overflow: hidden; background: var(--bg); cursor: text; }
-  #term { position: absolute; inset: 0; padding: 0.5em 0.6em; font-size: 14px; line-height: 1.45;
+  #term { position: absolute; inset: 0; padding: 0.5em 0.6em; font-size: 14px; line-height: 1.25;
           font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
           color: var(--term-fg);
+          -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
           user-select: text; -webkit-user-select: text; }
   #term ::selection { background: rgba(76, 154, 255, 0.32); }
-  #term .trow { white-space: pre; height: 1.45em; line-height: 1.45; overflow: hidden; }
+  #term .trow { position: relative; white-space: pre; height: 1.25em; line-height: 1.25; overflow: hidden; }
+  #term .trow > span { position: relative; }
+  #term .bgseg { position: absolute; top: 0; height: 100%; pointer-events: none;
+                 user-select: none; -webkit-user-select: none; }
   #term .cur { background: var(--term-fg); color: var(--bg); }
   #termwrap.focused #term .cur { animation: curblink 1.1s steps(1) infinite; }
   @keyframes curblink { 0%, 55% { background: var(--term-fg); color: var(--bg); }
                         56%, 100% { background: transparent; color: inherit; } }
   #termwrap:not(.focused) #term .cur { background: transparent; color: inherit;
                         box-shadow: inset 0 0 0 1px #6e7787; animation: none; }
-  #ime { position: absolute; width: 4px; height: 1.45em; opacity: 0.01; border: 0; padding: 0;
+  #ime { position: absolute; width: 4px; height: 1.25em; opacity: 0.01; border: 0; padding: 0;
          font-size: 16px; background: transparent; color: transparent; caret-color: transparent;
          resize: none; overflow: hidden; pointer-events: none; outline: none; z-index: 5; }
   #preedit { position: absolute; display: none; white-space: pre; pointer-events: none; z-index: 6;
-             font-size: 14px; line-height: 1.45; padding: 0;
+             font-size: 14px; line-height: 1.25; padding: 0;
+             -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
              font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
              color: var(--term-fg); background: var(--bg);
              text-decoration: underline; text-underline-offset: 3px; }
@@ -727,7 +732,9 @@ function spanCss(s) {
   if (s.reverse) { const t = fg; fg = bg; bg = t; if (fg === null) fg = "#0c0f14"; if (bg === null) bg = "#d8dee9"; }
   let css = "";
   if (fg) css += "color:" + fg + ";";
-  if (bg) css += "background-color:" + bg + ";";
+  // No background-color here: cell backgrounds are painted by the row's
+  // .bgseg layer (paintRowBackground), because an inline span's background
+  // only covers the font's content area and leaves stripes between rows.
   if (s.bold) css += "font-weight:bold;";
   if (s.dim) css += "opacity:0.6;";
   if (s.italic) css += "font-style:italic;";
@@ -740,6 +747,37 @@ function styleKeyOf(s) {
 }
 function combinedRow(idx) { // idx over scrollback+grid
   return idx < term.scrollback.length ? term.scrollback[idx] : term.grid[idx - term.scrollback.length];
+}
+const TERM_BG = "#0c0f14"; // default background (matches --bg); never painted explicitly
+function paintRowBackground(rowEl, rowArr, cursorX) {
+  // Paint the row's cell backgrounds as one absolutely-positioned div per
+  // run of equal effective bg, behind the text spans. Run edges are snapped
+  // to device pixels so adjacent runs share the exact same boundary and
+  // tile seamlessly; the div height is the full row height, unlike an
+  // inline span's background, which stops at the font's content area.
+  // The cursor cell is left out: the .cur span paints it, as before.
+  const dpr = window.devicePixelRatio || 1;
+  const snap = (v) => Math.round(v * dpr) / dpr;
+  let runBg = null, runStart = 0;
+  const flush = (endX) => {
+    if (runBg === null || endX <= runStart) return;
+    const d = document.createElement("div");
+    d.className = "bgseg";
+    const left = snap(runStart * charW);
+    d.style.left = left + "px";
+    d.style.width = (snap(endX * charW) - left) + "px";
+    d.style.backgroundColor = runBg;
+    rowEl.appendChild(d);
+    runBg = null;
+  };
+  for (let x = 0; x < term.cols; x++) {
+    const cell = rowArr[x];
+    if (!cell || cell.w === 0) continue;
+    const bg = x === cursorX ? TERM_BG : cellPaint(cell).bg;
+    const eff = bg === TERM_BG ? null : bg;
+    if (eff !== runBg) { flush(x); if (eff !== null) { runBg = eff; runStart = x; } }
+  }
+  flush(term.cols);
 }
 function render() {
   renderQueued = false;
@@ -759,6 +797,7 @@ function render() {
     const rowArr = combinedRow(base + y);
     const isCurRow = showCursor && y === term.cy;
     rowEl.textContent = "";
+    paintRowBackground(rowEl, rowArr, isCurRow ? term.cx : -1);
     let span = null, spanKey = null;
     const flushText = (cell, isCur) => {
       const key = isCur ? " CUR" : styleKeyOf(cell.s);
@@ -1141,6 +1180,29 @@ function screenToCanvas() { // redraw the visible window from the cell grid
   for (let y = 0; y < term.rows; y++) {
     const rowArr = combinedRow(base + y);
     const y0 = padT + y * lineH;
+    // Background first, merged into runs of equal effective bg with
+    // device-pixel-snapped edges: painting one fillRect per cell at
+    // fractional charW/lineH coordinates left antialiased seams on every
+    // cell boundary (a visible mesh over background-colored regions).
+    const snapC = (v) => Math.round(v * scale) / scale;
+    const yTop = snapC(y0), yBot = snapC(y0 + lineH);
+    let runBg = null, runStart = 0;
+    const flushBg = (endX) => {
+      if (runBg === null || endX <= runStart) return;
+      const xL = snapC(padL + runStart * charW), xR = snapC(padL + endX * charW);
+      ctx.fillStyle = runBg;
+      ctx.fillRect(xL, yTop, xR - xL, yBot - yTop);
+      runBg = null;
+    };
+    for (let x = 0; x < term.cols; x++) {
+      const cell = rowArr[x];
+      if (!cell || cell.w === 0) continue;
+      let bg = cellPaint(cell).bg;
+      if (showCursor && y === term.cy && x === term.cx) bg = "#d8dee9";
+      const eff = bg === "#0c0f14" ? null : bg;
+      if (eff !== runBg) { flushBg(x); if (eff !== null) { runBg = eff; runStart = x; } }
+    }
+    flushBg(term.cols);
     for (let x = 0; x < term.cols; x++) {
       const cell = rowArr[x];
       if (!cell || cell.w === 0) continue;
@@ -1148,7 +1210,6 @@ function screenToCanvas() { // redraw the visible window from the cell grid
       const paint = cellPaint(cell);
       let fg = paint.fg, bg = paint.bg;
       if (showCursor && y === term.cy && x === term.cx) { fg = "#0c0f14"; bg = "#d8dee9"; }
-      if (bg !== "#0c0f14") { ctx.fillStyle = bg; ctx.fillRect(x0, y0, cw, lineH); }
       if (cell.t && cell.t !== " ") {
         ctx.font = (cell.s.italic ? "italic " : "") + (cell.s.bold ? "bold " : "") + fontSize + "px " + fontFamily;
         ctx.globalAlpha = cell.s.dim ? 0.6 : 1;
