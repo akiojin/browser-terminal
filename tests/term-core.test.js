@@ -525,5 +525,62 @@ function splitAfter(s, marker) { // [through marker, rest]
   eq(helpers.syncHoldAction(true, true), "wait", "syncHold: block open, timer armed -> wait");
 }
 
+// 30. TermCore counts ?2026 block closes (syncClosed): the paint path
+// uses the counter to notice that a frame became final inside a feed.
+{
+  const t = new TermCore(80, 24);
+  eq(t.syncClosed, 0, "?2026 count: starts at 0");
+  t.feed("\x1b[?2026h");
+  eq(t.syncClosed, 0, "?2026 count: open does not count");
+  t.feed("\x1b[?2026l");
+  eq(t.syncClosed, 1, "?2026 count: close counts once");
+  t.feed("\x1b[?2026l");
+  eq(t.syncClosed, 1, "?2026 count: redundant close does not count");
+  t.feed("\x1b[?2026h\x1b[?2026l");
+  eq(t.syncClosed, 2, "?2026 count: open+close inside one feed counts");
+  t.feed("\x1b[?1006;2026h");
+  t.feed("\x1b[?1006;2026l");
+  eq(t.syncClosed, 3, "?2026 count: combined params count");
+  t.resetAll();
+  eq(t.syncClosed, 0, "?2026 count: resetAll clears the counter");
+}
+
+// 31. UI helpers: the sync-close paint decision and the wheel send plan.
+{
+  const hBegin = html.indexOf("/* === UI-HELPERS-BEGIN === */");
+  const hEnd = html.indexOf("/* === UI-HELPERS-END === */");
+  const helpers = new Function(html.slice(hBegin, hEnd) +
+    "\nreturn { syncClosePaint, planWheelSend };")();
+  const scp = helpers.syncClosePaint;
+  eq(scp(-Infinity, 0, 8), true, "syncClosePaint: never painted -> paint now");
+  eq(scp(100, 105, 8), false, "syncClosePaint: 5ms after last paint -> coalesce");
+  eq(scp(100, 108, 8), true, "syncClosePaint: 8ms after last paint -> paint now");
+  const plan = helpers.planWheelSend;
+  const check = (acc, gestureStart, cap, steps, rest, name) => {
+    const p = plan(acc, 20, cap, gestureStart);
+    eq(p.steps, steps, name + " (steps)");
+    eq(p.restPx, rest, name + " (rest)");
+  };
+  check(0, false, 3, 0, 0, "wheelPlan: no delta");
+  check(19, false, 3, 0, 19, "wheelPlan: sub-line mid-gesture waits");
+  check(19, true, 3, 1, -1, "wheelPlan: gesture start borrows the first line");
+  check(3, true, 3, 1, -17, "wheelPlan: small first delta still starts");
+  check(1, true, 3, 0, 1, "wheelPlan: 1px jitter does not start");
+  check(-3, true, 3, -1, 17, "wheelPlan: upward gesture start borrows");
+  check(20, false, 3, 1, 0, "wheelPlan: exactly one line");
+  check(75, false, 3, 3, 15, "wheelPlan: event cap leaves a drainable backlog");
+  check(-75, false, 3, -3, -15, "wheelPlan: upward event cap");
+  check(45, false, 2, 2, 5, "wheelPlan: drain cap");
+  // Distance preservation over a gesture: borrowed line is repaid by the
+  // accumulator, so the total steps match the pixel distance.
+  let acc = 0, total = 0;
+  for (const d of [3, 5, 8, 12, 17, 23, 30]) {
+    acc += d;
+    const p = plan(acc, 20, 3, total === 0);
+    total += p.steps; acc = p.restPx;
+  }
+  eq(total, Math.floor(98 / 20), "wheelPlan: gesture total matches distance");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

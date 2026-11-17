@@ -208,6 +208,7 @@ class TermCore {
     this.cursorVisible = true;   // ?25
     this.bracketedPaste = false; // ?2004
     this.syncUpdate = false;     // ?2026 synchronized update in progress
+    this.syncClosed = 0;         // ?2026 blocks closed so far (paint scheduling)
     this.mouseModes = new Set(); // ?1000/1002/1003 tracking, ?1006 SGR encoding
     this.g0 = "B"; this.g1 = "B"; this.gl = 0;
     this.state = "ground"; this.escBuf = ""; this.csiPrefix = "";
@@ -601,7 +602,12 @@ class TermCore {
             else if (n === 1048) { if (set) this.altSaved = this.saveCursor(); else this.restoreCursor(this.altSaved); }
             else if (n === 1049) this.setAltScreen(set, true);
             else if (n === 2004) this.bracketedPaste = set;
-            else if (n === 2026) this.syncUpdate = set;
+            else if (n === 2026) {
+              if (set !== this.syncUpdate) {
+                this.syncUpdate = set;
+                if (!set) this.syncClosed++; // a frame just became final
+              }
+            }
             else if (n === 1000 || n === 1002 || n === 1003 || n === 1006) {
               if (set) this.mouseModes.add(n); else this.mouseModes.delete(n);
             }
@@ -761,6 +767,32 @@ function syncHoldAction(syncActive, timerPending) {
   if (!syncActive) return "render";
   return timerPending ? "wait" : "hold";
 }
+function syncClosePaint(lastPaintMs, nowMs, minIntervalMs) {
+  // A ?2026 block just closed and its frame is final: painting it in the
+  // current task (instead of waiting for the next animation frame) cuts
+  // up to a frame of latency. But if the previous paint finished very
+  // recently, closes are arriving faster than paints can help — painting
+  // every one would burn time on frames nobody sees. Then the caller
+  // falls back to the rAF queue, where stale frames coalesce and only
+  // the latest state is painted (latest-wins).
+  return nowMs - lastPaintMs >= minIntervalMs;
+}
+function planWheelSend(accPx, lineH, maxSteps, gestureStart) {
+  // Decide how many wheel steps to forward to a mouse-reporting app for
+  // the accumulated pixel delta. The wire unit is whole lines — and the
+  // app repaints its whole viewport per step (Codex: ~5.5KB), so the
+  // step count is also the repaint budget. A fresh gesture (first event
+  // after an idle gap) sends its first step immediately instead of
+  // waiting for a full line of delta to accumulate: the accumulator
+  // borrows that line (restPx goes negative), so the total distance
+  // over the gesture still matches the pixel delta. Steps are capped
+  // per call so one event cannot queue an unbounded repaint burst;
+  // the caller drains any remaining backlog on a short timer.
+  let steps = Math.trunc(accPx / lineH);
+  if (steps === 0 && gestureStart && Math.abs(accPx) >= 2) steps = accPx > 0 ? 1 : -1;
+  if (steps > maxSteps) steps = maxSteps; else if (steps < -maxSteps) steps = -maxSteps;
+  return { steps, restPx: accPx - steps * lineH };
+}
 function errorBarAfterEvent(current, event) {
   // The error bar's next text. A server "error" event replaces the text;
   // a successful "session" event clears it; anything else (socket open /
@@ -796,7 +828,10 @@ const sbthumb = document.getElementById("sbthumb");
 const term = new TermCore(80, 24);
 let viewOffset = 0;       // lines scrolled back into history (0 = live)
 let wheelAcc = 0;         // sub-line wheel delta accumulated for app forwarding
+let localWheelAcc = 0;    // sub-line wheel delta accumulated for local scrolling
 let renderQueued = false;
+let rafHandle = null;     // pending requestAnimationFrame handle, if any
+let lastPaintAt = -Infinity; // performance.now() when the last render() finished
 let prevSbLen = 0;
 let charW = 8, lineH = 20;
 
@@ -912,6 +947,7 @@ function paintRow(rowEl, rowArr, cursorX) {
 }
 function render() {
   renderQueued = false;
+  rafHandle = null;
   // Keep the viewed window stable while new lines land in scrollback.
   if (viewOffset > 0 && term.sbAdded > 0) viewOffset = Math.min(term.scrollback.length, viewOffset + term.sbAdded);
   term.sbAdded = 0;
@@ -983,9 +1019,16 @@ function render() {
   } else {
     preeditEl.style.display = "none";
   }
+  lastPaintAt = performance.now();
 }
 function requestRender() {
-  if (!renderQueued) { renderQueued = true; requestAnimationFrame(render); }
+  if (!renderQueued) { renderQueued = true; rafHandle = requestAnimationFrame(render); }
+}
+function renderNow() {
+  // Paint synchronously, dropping any queued rAF paint (it would show
+  // this same state again). Used when a frame just became final.
+  if (rafHandle !== null) { cancelAnimationFrame(rafHandle); rafHandle = null; }
+  render();
 }
 // While a ?2026 synchronized update is open, the frame TermCore holds is
 // not final: painting it would show the half-drawn state (tearing). Hold
@@ -993,12 +1036,21 @@ function requestRender() {
 // unterminated block), the fallback timer paints what we have after
 // SYNC_HOLD_MS so the screen cannot freeze mid-block.
 const SYNC_HOLD_MS = 100;
+// Minimum spacing between synchronous paints after a ?2026 close. Below
+// this, closes are arriving faster than painting helps, so the paint
+// goes through the rAF queue and stale frames coalesce (latest-wins).
+const IMMEDIATE_PAINT_MIN_MS = 8;
 let syncHoldTimer = null;
-function afterTermFeed() {
+function afterTermFeed(closedBefore) {
   const action = syncHoldAction(term.syncUpdate, syncHoldTimer !== null);
   if (action === "render") {
     if (syncHoldTimer) { clearTimeout(syncHoldTimer); syncHoldTimer = null; }
-    requestRender();
+    if (term.syncClosed !== closedBefore &&
+        syncClosePaint(lastPaintAt, performance.now(), IMMEDIATE_PAINT_MIN_MS)) {
+      renderNow(); // a block closed in this feed: its frame is final
+    } else {
+      requestRender();
+    }
   } else if (action === "hold") {
     syncHoldTimer = setTimeout(() => { syncHoldTimer = null; requestRender(); }, SYNC_HOLD_MS);
   }
@@ -1145,11 +1197,13 @@ function connect() {
         }
         return;
       } catch (e) { /* not JSON: render as terminal output */ }
+      const closedBeforeS = term.syncClosed;
       term.feed(ev.data);
-      afterTermFeed();
+      afterTermFeed(closedBeforeS);
     } else {
+      const closedBeforeB = term.syncClosed;
       term.feed(decoder.decode(new Uint8Array(ev.data), { stream: true }));
-      afterTermFeed();
+      afterTermFeed(closedBeforeB);
     }
   };
 }
@@ -1312,6 +1366,43 @@ document.addEventListener("copy", () => {
   // After a copy, clear the selection so the next Ctrl-C is SIGINT again.
   setTimeout(() => { const s = window.getSelection(); if (s) s.removeAllRanges(); }, 0);
 });
+// --- wheel forwarding -------------------------------------------------------
+// A mouse-reporting app repaints its whole viewport per wheel step, so
+// forwarding is paced: a gesture's first step goes out immediately
+// (planWheelSend borrows the line instead of waiting for a full line of
+// delta), each event sends at most WHEEL_EVENT_CAP steps, and whatever
+// backlog the cap leaves in the accumulator drains on a short timer —
+// the tail must not sit waiting for a future wheel event, or the app
+// keeps scrolling long after the gesture ended (and a stranded tail
+// makes the next gesture start with a jump).
+const WHEEL_GESTURE_IDLE_MS = 120; // gap that marks the start of a gesture
+const WHEEL_EVENT_CAP = 3;         // steps per wheel event
+const WHEEL_DRAIN_MS = 10;         // backlog drain interval
+const WHEEL_DRAIN_CAP = 2;         // steps per drain tick
+let lastWheelAt = -Infinity;
+let wheelDrainTimer = null;
+let wheelCol = 1, wheelRow = 1;    // pointer cell of the last wheel event
+function sendWheelSteps(steps) {
+  const btn = steps > 0 ? 65 : 64; // 64 = wheel up, 65 = wheel down
+  let seq = "";
+  for (let i = 0, n = Math.abs(steps); i < n; i++) {
+    seq += term.mouseModes.has(1006)
+      ? "\x1b[<" + btn + ";" + wheelCol + ";" + wheelRow + "M"
+      : "\x1b[M" + String.fromCharCode(btn + 32, wheelCol + 32, wheelRow + 32);
+  }
+  if (seq) sendInput(seq);
+}
+function scheduleWheelDrain() {
+  if (wheelDrainTimer !== null || Math.abs(wheelAcc) < lineH) return;
+  wheelDrainTimer = setTimeout(() => {
+    wheelDrainTimer = null;
+    if (term.mouseModes.size === 0) { wheelAcc = 0; return; }
+    const plan = planWheelSend(wheelAcc, lineH, WHEEL_DRAIN_CAP, false);
+    wheelAcc = plan.restPx;
+    if (plan.steps !== 0) sendWheelSteps(plan.steps);
+    scheduleWheelDrain();
+  }, WHEEL_DRAIN_MS);
+}
 termwrap.addEventListener("wheel", (e) => {
   e.preventDefault();
   // When the app has mouse reporting on (full-screen TUIs such as Codex),
@@ -1319,32 +1410,29 @@ termwrap.addEventListener("wheel", (e) => {
   // no-op. Forward the wheel to the app instead, like other terminals do.
   // Clicks/selection stay local to preserve bt's copy behaviour.
   if (!e.shiftKey && term.mouseModes.size > 0) {
-    // Accumulate sub-line trackpad deltas and emit at most one wheel
-    // sequence per line of scroll (max 3 per event). Sending several
-    // sequences per event makes the app repaint its whole screen once per
-    // sequence, which reads as lag and flicker.
+    const now = performance.now();
+    const gestureStart = now - lastWheelAt > WHEEL_GESTURE_IDLE_MS;
+    lastWheelAt = now;
     wheelAcc += e.deltaMode === 1 ? e.deltaY * lineH
               : e.deltaMode === 2 ? e.deltaY * lineH * term.rows
               : e.deltaY;
-    let steps = Math.trunc(wheelAcc / lineH);
-    if (steps === 0) return;
-    if (steps > 3) steps = 3; else if (steps < -3) steps = -3;
-    wheelAcc -= steps * lineH;
     const rect = termwrap.getBoundingClientRect();
-    const col = Math.max(1, Math.min(term.cols, Math.floor((e.clientX - rect.left) / charW) + 1));
-    const row = Math.max(1, Math.min(term.rows, Math.floor((e.clientY - rect.top) / lineH) + 1));
-    const btn = steps > 0 ? 65 : 64; // 64 = wheel up, 65 = wheel down
-    let seq = "";
-    for (let i = 0, n = Math.abs(steps); i < n; i++) {
-      seq += term.mouseModes.has(1006)
-        ? "\x1b[<" + btn + ";" + col + ";" + row + "M"
-        : "\x1b[M" + String.fromCharCode(btn + 32, col + 32, row + 32);
-    }
-    if (seq) sendInput(seq);
+    wheelCol = Math.max(1, Math.min(term.cols, Math.floor((e.clientX - rect.left) / charW) + 1));
+    wheelRow = Math.max(1, Math.min(term.rows, Math.floor((e.clientY - rect.top) / lineH) + 1));
+    const plan = planWheelSend(wheelAcc, lineH, WHEEL_EVENT_CAP, gestureStart);
+    wheelAcc = plan.restPx;
+    if (plan.steps !== 0) sendWheelSteps(plan.steps);
+    scheduleWheelDrain();
     return;
   }
-  const lines = e.deltaMode === 1 ? Math.round(e.deltaY) : Math.round(e.deltaY / lineH);
+  // Local scrollback: accumulate sub-line deltas across events too —
+  // rounding each event on its own threw gentle trackpad scrolls away.
+  localWheelAcc += e.deltaMode === 1 ? e.deltaY * lineH
+                 : e.deltaMode === 2 ? e.deltaY * lineH * term.rows
+                 : e.deltaY;
+  const lines = Math.trunc(localWheelAcc / lineH);
   if (lines !== 0) {
+    localWheelAcc -= lines * lineH;
     viewOffset = Math.max(0, Math.min(term.scrollback.length, viewOffset - lines));
     requestRender();
   }
