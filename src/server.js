@@ -21,6 +21,7 @@ const { parse: parseToml } = require('smol-toml');
 const { repairNodePtySpawnHelpers, probePtySpawn } = require('./spawn-helper');
 const { createOsc7Tracker, readProcCwd, parseLsofCwd } = require('./cwd');
 const { idleTimeoutMs, isIdle, sweepIntervalMs } = require('./idle');
+const { shellArgs } = require('./shell');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -226,13 +227,16 @@ function shellCommand() {
   if (process.platform === 'win32') {
     const shell =
       CONFIG.shell || (programExists('pwsh') ? 'pwsh' : 'powershell');
-    return { file: shell, args: ['-NoLogo'] };
+    return { file: shell, args: shellArgs(process.platform) };
   }
   const shell =
     CONFIG.shell ||
     (process.env.SHELL && process.env.SHELL.length > 0 ? process.env.SHELL : null) ||
     (fs.existsSync('/bin/zsh') ? '/bin/zsh' : '/bin/bash');
-  return { file: shell, args: ['-i'] };
+  // Login + interactive, so the session picks up login-shell startup
+  // files (~/.zprofile, path_helper, Homebrew shellenv) like a desktop
+  // terminal does. See src/shell.js.
+  return { file: shell, args: shellArgs(process.platform) };
 }
 
 // ---------------------------------------------------------------------------

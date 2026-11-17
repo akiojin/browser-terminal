@@ -152,7 +152,10 @@ to an existing session; closing a tab does not kill its shell.
 
 Shell used per session:
 
-- macOS / Linux: `$SHELL`, falling back to zsh, then bash.
+- macOS / Linux: `$SHELL`, falling back to zsh, then bash. Sessions are
+  started as login + interactive shells, so login-shell startup files
+  (`~/.zprofile`, `~/.bash_profile`, Homebrew's `shellenv`, ...) are read
+  just like in a desktop terminal.
 - Windows: `pwsh` if installed, otherwise Windows PowerShell (PTY via
   ConPTY, Windows 10 1809+).
 

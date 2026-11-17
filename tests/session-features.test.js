@@ -2,17 +2,20 @@
 //   - cwd tracking (src/cwd.js + the UI's formatCwdLabel helper)
 //   - idle timeout decisions (src/idle.js)
 //   - OS service unit generation (src/service-helper.js)
+//   - shell spawn arguments (src/shell.js): POSIX sessions are login +
+//     interactive so login-shell startup files are honored
 //   - an end-to-end pass against a real server: the session list reports
 //     the shell's cwd after `cd`, and an idle session is closed when
 //     idle_timeout_minutes is set.
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 
 const { parseOsc7Payload, createOsc7Tracker, readProcCwd, parseLsofCwd } = require("../src/cwd");
 const { idleTimeoutMs, isIdle, sweepIntervalMs } = require("../src/idle");
 const { launchAgentPlist, systemdUnit, servicePlan, LAUNCHD_LABEL } = require("../src/service-helper");
+const { shellArgs } = require("../src/shell");
 
 let failures = 0;
 function eq(actual, expected, name) {
@@ -111,6 +114,33 @@ function ok(cond, name) { eq(!!cond, true, name); }
     eq(helpers.formatCwdLabel(""), "", "ui: empty cwd -> blank label");
     eq(helpers.formatCwdLabel(null), "", "ui: null cwd -> blank label");
     ok(html.includes('id="cwd"'), "ui: cwd element present in header");
+  }
+}
+
+// --- shell spawn arguments -----------------------------------------------------
+{
+  eq(JSON.stringify(shellArgs("darwin")), JSON.stringify(["-l", "-i"]),
+     "shellArgs: macOS is login + interactive");
+  eq(JSON.stringify(shellArgs("linux")), JSON.stringify(["-l", "-i"]),
+     "shellArgs: linux is login + interactive");
+  eq(JSON.stringify(shellArgs("win32")), JSON.stringify(["-NoLogo"]),
+     "shellArgs: windows keeps -NoLogo only");
+
+  // End-to-end: with the POSIX args, a real bash must read ~/.bash_profile
+  // (a login-only startup file). The marker is set nowhere else, so seeing
+  // it proves the login startup path ran.
+  if (process.platform !== "win32" && fs.existsSync("/bin/bash")) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bt-shell-test-"));
+    try {
+      fs.writeFileSync(path.join(home, ".bash_profile"),
+        "export BT_LOGIN_MARKER=login-file-read\n");
+      const res = spawnSync("/bin/bash",
+        [...shellArgs(process.platform), "-c", "printf %s \"$BT_LOGIN_MARKER\""],
+        { env: Object.assign({}, process.env, { HOME: home }), encoding: "utf8", timeout: 15000 });
+      eq(res.stdout, "login-file-read", "shellArgs: login startup file is read by the spawned shell");
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   }
 }
 
