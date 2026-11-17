@@ -69,4 +69,9 @@ URL をブラウザで開くことだけです。
 - 更新：`git -C ~/tools/browser-terminal pull && cd ~/tools/browser-terminal && npm install` してから再起動。
 - エージェント向け API を使う場合は、設定ファイルの `api_enabled = true`
   に変更して再起動する（既定はオフ。API の使い方は README の "Agent API" 節）。
+- ログイン時に自動起動させたい場合は `npm run service -- install` で
+  OS サービス（macOS は LaunchAgent、Linux は systemd ユーザーユニット）に
+  登録できる（README の "Run it as a background service" 節）。
+- 入力も出力もないセッションを自動で閉じたい場合は、設定ファイルの
+  `idle_timeout_minutes` に分数を指定する（既定 0 ＝ 無効）。
 - 手動で入れる場合の手順は README の "Install" 節にあります。
