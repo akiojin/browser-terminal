@@ -12,8 +12,12 @@
  *     (64K/write, catch-up drain over a 256K backlog) before term.write,
  *     so the app never paints a half-arrived repaint frame;
  *   - wheel pacing: while the app reports the mouse, wheel deltas are
- *     accumulated in pixels and forwarded as capped SGR reports with a
- *     drain timer, like bt's src/ui.html (a23def2 / 095fc93).
+ *     forwarded with xterm's own native semantics (fractional-line
+ *     accumulation, at most one report per event, no backlog drain) —
+ *     a wheel report makes the app repaint its whole viewport, so the
+ *     forwarded count must not scale with flick distance. (bt's
+ *     full-distance drain contract was tried first and froze the real
+ *     machine; see bt-xterm-evaluation.md.)
  * Test hooks live on window.__spike. */
 const params = new URLSearchParams(location.search);
 const token = params.get("token") || "";
@@ -114,6 +118,7 @@ function writeFromQueue(maxBytes) {
   if (total > outStats.maxWrite) outStats.maxWrite = total;
   return total;
 }
+let outFlushFailures = 0;
 function flushOutput() {
   outFlushScheduled = false;
   if (!outQueue.length) return;
@@ -122,10 +127,19 @@ function flushOutput() {
   // Base case: one capped write per tick. Catch-up drain: while the
   // backlog stays at/above the threshold, keep writing inside the
   // budget so a big replay or burst catches up within a few frames.
-  do {
-    writeFromQueue(OUT_WRITE_CAP);
-    if (outQueuedBytes < OUT_CATCHUP_MIN) break;
-  } while (performance.now() - start < OUT_BUDGET_MS);
+  try {
+    do {
+      writeFromQueue(OUT_WRITE_CAP);
+      if (outQueuedBytes < OUT_CATCHUP_MIN) break;
+    } while (performance.now() - start < OUT_BUDGET_MS);
+    outFlushFailures = 0;
+  } catch (err) {
+    // A throwing term.write must not strand the queue in silence:
+    // retry on the next tick, but drop the backlog after repeated
+    // failures rather than spin forever on a broken stream.
+    outFlushFailures++;
+    if (outFlushFailures >= 5) { resetOutputQueue(); outFlushFailures = 0; }
+  }
   if (outQueuedBytes > 0) scheduleOutFlush();
 }
 function resetOutputQueue() {
@@ -249,34 +263,31 @@ function connect() {
 term.onData((data) => { sentLog.push(data); sendInput(data); });
 term.onResize(({ cols, rows }) => sendResize(cols, rows));
 
-// --- wheel pacing (mirrors bt src/ui.html: a23def2 / 095fc93) ---------------
-// A mouse-reporting app repaints its whole viewport per wheel step, so
-// forwarding is paced exactly like bt's: deltas accumulate in pixels, a
-// gesture's first step goes out immediately (planWheelSend borrows the
-// line), each event sends at most WHEEL_EVENT_CAP steps, and the capped
-// backlog drains on a 10ms timer at WHEEL_DRAIN_CAP steps per tick.
-// xterm's own wheel handling is left alone whenever the app is not
-// reporting the mouse (handler returns true -> local scrollback scroll).
+// --- wheel pacing (xterm-native semantics) ----------------------------------
+// A mouse-reporting app repaints its whole viewport per wheel report
+// (Codex at 235x60: up to ~27KB), so the forwarded count must NOT scale
+// with the pixel distance of a flick. xterm's own conversion
+// (CoreMouseService.consumeWheelEvent + a single triggerMouseEvent per
+// DOM event) is the model, and it is also what gwt gets for free on the
+// Codex path: deltas accumulate as fractional lines, an event emits at
+// most ONE report, whole-line excess is dropped, and only the sub-line
+// fraction carries over — no backlog can ever form.
+//
+// The first version of this spike instead imported bt's planWheelSend
+// contract (borrow + a 10ms drain until the FULL pixel distance has
+// been delivered). That contract is right for bt, whose wheel forwards
+// to a local renderer, and wrong here: in the VM live-loop reproduction
+// a 540px flick became ~17 reports/event (401 sent + ~464 still queued
+// after 51 events, vs exactly 1/event native), the repaint flood
+// saturated the main thread, the drain timer slipped from 10ms to
+// ~500ms, and the flood sustained itself long after the flick ended —
+// the 7th machine's "固まる". There is deliberately no drain timer.
 const WHEEL_GESTURE_IDLE_MS = 120; // gap that marks the start of a gesture
-const WHEEL_EVENT_CAP = 3;         // steps per wheel event
-const WHEEL_DRAIN_MS = 10;         // backlog drain interval
-const WHEEL_DRAIN_CAP = 2;         // steps per drain tick
-let wheelAcc = 0;                  // sub-line pixel delta awaiting forwarding
+let wheelPartial = 0;              // sub-line carry, in line units (signed)
 let lastWheelAt = -Infinity;
-let wheelDrainTimer = null;
+let lastLineH = 0;                 // last cell height (wheelState hook)
 let wheelCol = 1, wheelRow = 1;    // pointer cell of the last wheel event
 let sgrMouse = false;              // DECSET 1006, tracked by scanning output
-
-function planWheelSend(accPx, lineH, maxSteps, gestureStart) {
-  // Same contract as bt's: whole-line steps only, a fresh gesture may
-  // borrow its first line (restPx goes negative) so the total distance
-  // over the gesture still matches the pixel delta, and the per-call
-  // cap keeps one event from queueing an unbounded repaint burst.
-  let steps = Math.trunc(accPx / lineH);
-  if (steps === 0 && gestureStart && Math.abs(accPx) >= 2) steps = accPx > 0 ? 1 : -1;
-  if (steps > maxSteps) steps = maxSteps; else if (steps < -maxSteps) steps = -maxSteps;
-  return { steps, restPx: accPx - steps * lineH };
-}
 function cellDims() {
   // Cell metrics from xterm's render service (same source the buffer
   // screenshot code below uses); fall back to element size / grid.
@@ -302,20 +313,7 @@ function sendWheelSteps(steps) {
   }
   if (seq) sendInput(seq);
 }
-function scheduleWheelDrain() {
-  const dims = cellDims();
-  if (wheelDrainTimer !== null || !dims || Math.abs(wheelAcc) < dims.h) return;
-  wheelDrainTimer = setTimeout(() => {
-    wheelDrainTimer = null;
-    if (term.modes.mouseTrackingMode === "none") { wheelAcc = 0; return; }
-    const d = cellDims();
-    if (!d) { wheelAcc = 0; return; }
-    const plan = planWheelSend(wheelAcc, d.h, WHEEL_DRAIN_CAP, false);
-    wheelAcc = plan.restPx;
-    if (plan.steps !== 0) sendWheelSteps(plan.steps);
-    scheduleWheelDrain();
-  }, WHEEL_DRAIN_MS);
-}
+
 // Track DECSET/DECRST 1006 (SGR mouse encoding) by scanning the output
 // stream itself. A parser.registerCsiHandler hook cannot do this: the
 // built-in DECSET handler is registered first and consumes the sequence
@@ -353,11 +351,10 @@ function scanForSgrMode(bytes) {
   }
 }
 function resetWheelState() {
-  wheelAcc = 0;
+  wheelPartial = 0;
   lastWheelAt = -Infinity;
   sgrMouse = false;
   csiScan = null;
-  if (wheelDrainTimer !== null) { clearTimeout(wheelDrainTimer); wheelDrainTimer = null; }
 }
 term.attachCustomWheelEventHandler((e) => {
   if (e.shiftKey) return true; // keep xterm's shift+wheel behaviour
@@ -365,19 +362,35 @@ term.attachCustomWheelEventHandler((e) => {
   const dims = cellDims();
   if (!dims || !term.element) return true;
   const lineH = dims.h;
+  lastLineH = lineH;
   const now = performance.now();
   const gestureStart = now - lastWheelAt > WHEEL_GESTURE_IDLE_MS;
   lastWheelAt = now;
-  wheelAcc += e.deltaMode === 1 ? e.deltaY * lineH
-            : e.deltaMode === 2 ? e.deltaY * lineH * term.rows
-            : e.deltaY;
   const rect = term.element.getBoundingClientRect();
   wheelCol = Math.max(1, Math.min(term.cols, Math.floor((e.clientX - rect.left) / dims.w) + 1));
   wheelRow = Math.max(1, Math.min(term.rows, Math.floor((e.clientY - rect.top) / dims.h) + 1));
-  const plan = planWheelSend(wheelAcc, lineH, WHEEL_EVENT_CAP, gestureStart);
-  wheelAcc = plan.restPx;
-  if (plan.steps !== 0) sendWheelSteps(plan.steps);
-  scheduleWheelDrain();
+  const deltaPx = e.deltaMode === 1 ? e.deltaY * lineH
+                : e.deltaMode === 2 ? e.deltaY * lineH * term.rows
+                : e.deltaY;
+  // Native conversion (consumeWheelEvent): pixels -> fractional lines,
+  // small pixel deltas damped, fractions accumulate across events.
+  let lines = deltaPx / lineH;
+  if (e.deltaMode === 0 && Math.abs(e.deltaY) < 50) lines *= 0.3;
+  wheelPartial += lines;
+  let steps = Math.trunc(wheelPartial);
+  if (steps === 0 && gestureStart && Math.abs(deltaPx) >= 2) {
+    // Borrow (kept from bt): a fresh gesture's first step goes out at
+    // once instead of waiting for a full line to accumulate; the carry
+    // goes negative, so the gesture's total stays honest.
+    steps = deltaPx > 0 ? 1 : -1;
+  }
+  if (steps !== 0) {
+    const dir = steps > 0 ? 1 : -1;
+    sendWheelSteps(dir); // exactly one report per event, like xterm
+    wheelPartial -= dir;
+  }
+  // Drop whole-line excess: only the sub-line fraction carries over.
+  wheelPartial %= 1;
   return false; // handled here; xterm must not forward or scroll itself
 });
 let resizeTimer = null;
@@ -497,8 +510,9 @@ window.__spike = {
              bytes: outStats.bytes, maxWrite: outStats.maxWrite };
   },
   wheelState() {
-    return { acc: wheelAcc, sgrMouse, col: wheelCol, row: wheelRow,
-             drainPending: wheelDrainTimer !== null,
+    return { acc: Math.round(wheelPartial * lastLineH), partial: wheelPartial,
+             sgrMouse, col: wheelCol, row: wheelRow,
+             drainPending: false, // native pacing has no drain by design
              mouseTrackingMode: term.modes.mouseTrackingMode };
   },
   connect,
