@@ -398,5 +398,58 @@ function splitAfter(s, marker) { // [through marker, rest]
   eq(helpers.errorBarAfterEvent("x", {}), "x", "errbar: typeless event keeps current text");
 }
 
+// 26. Wide chars: overwriting or erasing either half erases the whole
+// char (regression tests from bt-freeze-repro/repro-b-widechar.js — a
+// leftover half used to render as a stale glyph over TUI input lines).
+{
+  const t = new TermCore(20, 3);
+  t.feed("あいうえお");
+  t.feed("\x1b[1;2H"); // cx = 1: continuation cell of あ
+  t.feed("X");
+  eq(t.lineText(0), " Xいうえお", "wide: overwrite continuation cell erases the lead too");
+
+  const t2 = new TermCore(20, 3);
+  t2.feed("あいう");
+  t2.feed("\x1b[1;4H"); // cx = 3: continuation cell of い
+  t2.feed("\x1b[K");
+  eq(t2.lineText(0), "あ", "wide: EL from a continuation cell erases the whole char");
+
+  const t3 = new TermCore(20, 3);
+  t3.feed("あいう");
+  t3.feed("\x1b[1;2H"); // cx = 1: continuation cell of あ
+  t3.feed("\x1b[1P");
+  eq(t3.lineText(0), "あう", "wide: DCH at a continuation cell does not split the char");
+
+  const t4 = new TermCore(20, 3);
+  t4.feed("abcde");
+  t4.feed("\x1b[1;2H");
+  t4.feed("X");
+  eq(t4.lineText(0), "aXcde", "wide: narrow overwrite unchanged (control)");
+
+  const t5 = new TermCore(20, 3);
+  t5.feed("あい");
+  t5.feed("\x1b[1;1H"); // cx = 0: lead cell of あ
+  t5.feed("X");
+  eq(t5.lineText(0), "X い", "wide: overwrite lead cell erases the continuation too");
+
+  const t6 = new TermCore(20, 3);
+  t6.feed("ab");
+  t6.feed("\x1b[1;1H");
+  t6.feed("あ");
+  eq(t6.lineText(0), "あ", "wide: wide char overwrites two narrow cells cleanly");
+
+  const t7 = new TermCore(20, 3);
+  t7.feed("あいう");
+  t7.feed("\x1b[1;4H"); // cx = 3: continuation cell of い
+  t7.feed("\x1b[1X");   // ECH 1 (erase in place, no shift)
+  eq(t7.lineText(0), "あ  う", "wide: ECH on a continuation cell erases the whole char");
+
+  const t8 = new TermCore(20, 3);
+  t8.feed("あいう");
+  t8.feed("\x1b[1;2H"); // cx = 1: continuation cell of あ
+  t8.feed("\x1b[1@");   // ICH 1
+  eq(t8.lineText(0), "あ いう", "wide: ICH at a continuation cell does not split the char");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

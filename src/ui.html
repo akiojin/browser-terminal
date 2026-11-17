@@ -378,13 +378,28 @@ class TermCore {
       this.cx = 0; this.index(); this.wrapPending = false;
     }
     if (this.cx + width > this.cols) { // wide char that does not fit: wrap first
-      this.grid[this.cy][this.cols - 1] = { t: " ", w: 1, s: this.style };
+      const lastRow = this.grid[this.cy];
+      if (lastRow[this.cols - 1].w === 0 && this.cols >= 2)
+        lastRow[this.cols - 2] = { t: " ", w: 1, s: this.style };
+      lastRow[this.cols - 1] = { t: " ", w: 1, s: this.style };
       this.cx = 0; this.index();
     }
     const row = this.grid[this.cy];
+    // Overwriting either half of a wide char erases the whole char: blank
+    // the sibling half so no orphan lead/continuation cell survives (a
+    // leftover half renders as a stale glyph the app never repaints).
+    if (this.cx > 0 && row[this.cx].w === 0)
+      row[this.cx - 1] = { t: " ", w: 1, s: this.style };
     if (this.insertMode) {
       for (let x = this.cols - 1; x >= this.cx + width; x--) row[x] = row[x - width];
       if (width === 2 && this.cx + 1 < this.cols) row[this.cx + 1] = { t: " ", w: 1, s: this.style };
+    } else {
+      // The cell(s) about to be replaced may be the lead of a wide char
+      // whose other half lies just outside the replaced range.
+      if (width === 1 && row[this.cx].w === 2 && this.cx + 1 < this.cols)
+        row[this.cx + 1] = { t: " ", w: 1, s: this.style };
+      if (width === 2 && this.cx + 2 < this.cols && row[this.cx + 1] && row[this.cx + 1].w === 2)
+        row[this.cx + 2] = { t: " ", w: 1, s: this.style };
     }
     let text = ch;
     const charset = this.gl === 0 ? this.g0 : this.g1;
@@ -392,6 +407,7 @@ class TermCore {
     const cell = { t: text, w: width, s: this.style };
     row[this.cx] = cell;
     if (width === 2) row[this.cx + 1] = { t: "", w: 0, s: this.style };
+    if (this.insertMode) this.fixRowPairs(this.cy); // the shift may have split a pair
     this.lastCell = cell; this.lastChar = ch;
     if (this.cx + width >= this.cols) {
       if (this.wrapMode) { this.wrapPending = true; this.cx = this.cols - 1; }
@@ -399,8 +415,23 @@ class TermCore {
     } else this.cx += width;
   }
 
+  fixRowPairs(y) { // blank halves of wide chars broken by a shift or edit
+    const row = this.grid[y];
+    for (let x = 0; x < this.cols; x++) {
+      const c = row[x];
+      if (c.w === 0 && (x === 0 || row[x - 1].w !== 2))
+        row[x] = { t: " ", w: 1, s: c.s };       // continuation with no lead
+      else if (c.w === 2 && (x + 1 >= this.cols || row[x + 1].w !== 0))
+        row[x] = { t: " ", w: 1, s: c.s };       // lead with no continuation
+    }
+  }
+
   eraseCells(y, x0, x1) { // inclusive range
     const row = this.grid[y], es = this.eraseStyle();
+    // Erasing part of a wide char erases the whole char: widen the range
+    // to cover a pair that a range boundary cuts through.
+    if (x0 > 0 && row[x0] && row[x0].w === 0) x0--;
+    if (x1 < this.cols - 1 && row[x1] && row[x1].w === 2) x1++;
     for (let x = x0; x <= x1 && x < this.cols; x++) row[x] = { t: " ", w: 1, s: es };
   }
 
@@ -499,14 +530,33 @@ class TermCore {
       }
       case "P": { // delete chars
         const row = this.grid[this.cy], es = this.eraseStyle();
-        for (let x = this.cx; x < this.cols; x++)
-          row[x] = x + p1 < this.cols ? row[x + p1] : { t: " ", w: 1, s: es };
+        // The count is in characters, and a wide char deletes as a unit:
+        // a delete starting on a continuation cell begins at the next
+        // character boundary, and the shift distance is the total cell
+        // width of the deleted characters. Splitting a pair would leave
+        // a stale half behind.
+        let start = this.cx;
+        if (start < this.cols - 1 && row[start].w === 0) start++;
+        let cells = 0, x = start;
+        for (let n = 0; n < p1 && x < this.cols; n++) {
+          const w = row[x].w === 2 ? 2 : 1;
+          cells += w; x += w;
+        }
+        if (cells === 0) cells = p1;
+        for (let i = start; i < this.cols; i++)
+          row[i] = i + cells < this.cols ? row[i + cells] : { t: " ", w: 1, s: es };
+        this.fixRowPairs(this.cy);
         break;
       }
       case "@": { // insert blank chars
         const row = this.grid[this.cy], es = this.eraseStyle();
-        for (let x = this.cols - 1; x >= this.cx; x--)
-          row[x] = x - p1 >= this.cx ? row[x - p1] : { t: " ", w: 1, s: es };
+        // Same boundary rule as DCH: never split a wide char at the
+        // insertion point.
+        let start = this.cx;
+        if (start < this.cols - 1 && row[start].w === 0) start++;
+        for (let x = this.cols - 1; x >= start; x--)
+          row[x] = x - p1 >= start ? row[x - p1] : { t: " ", w: 1, s: es };
+        this.fixRowPairs(this.cy);
         break;
       }
       case "X": this.eraseCells(this.cy, this.cx, Math.min(this.cols - 1, this.cx + p1 - 1)); break;
