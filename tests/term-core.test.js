@@ -691,5 +691,135 @@ function splitAfter(s, marker) { // [through marker, rest]
   eq(t.screenText().trim(), "", "Codex probe bytes draw nothing");
 }
 
+// 34. UI helpers: SyncScan + planOutFeed — the receive-path batching
+// must know where ?2026 blocks begin and end in output TermCore has
+// not parsed yet, so a flush can feed whole frames and hold a frame
+// whose close has not arrived. The scanner mirrors TermCore's own
+// sequence handling (strings swallow up to BEL/ST, ESC aborts a CSI).
+{
+  const hBegin = html.indexOf("/* === UI-HELPERS-BEGIN === */");
+  const hEnd = html.indexOf("/* === UI-HELPERS-END === */");
+  const helpers = new Function(html.slice(hBegin, hEnd) +
+    "\nreturn { SyncScan, planOutFeed };")();
+  const { SyncScan, planOutFeed } = helpers;
+  const CAP = 64 * 1024, EXT = 64 * 1024;
+
+  // Plain text: no blocks, the cap is the only limit.
+  {
+    const s = new SyncScan();
+    s.scan("hello world");
+    eq(s.blocks.length, 0, "scan: plain text has no blocks");
+    eq(s.syncOpen, false, "scan: plain text leaves sync closed");
+    eq(planOutFeed(11, s.blocks, CAP, EXT), 11, "plan: short plain text feeds whole");
+    eq(planOutFeed(100000, s.blocks, CAP, EXT), CAP, "plan: plain text slices at the cap");
+    eq(planOutFeed(0, s.blocks, CAP, EXT), 0, "plan: empty queue feeds nothing");
+  }
+  // One complete block.
+  {
+    const s = new SyncScan();
+    const stream = "\x1b[?2026h" + "abc" + "\x1b[?2026l";
+    s.scan(stream);
+    eq(s.blocks.length, 1, "scan: one block recorded");
+    eq(s.blocks[0][0], 0, "scan: block starts at the open ESC");
+    eq(s.blocks[0][1], stream.length, "scan: block ends past the close final");
+    eq(s.syncOpen, false, "scan: closed block leaves sync closed");
+    eq(planOutFeed(stream.length, s.blocks, CAP, EXT), stream.length, "plan: a whole frame feeds whole");
+    s.consume(stream.length);
+    eq(s.blocks.length, 0, "scan: consume drops a fully fed block");
+  }
+  // Open block at the tail: feed only what precedes it.
+  {
+    const s = new SyncScan();
+    s.scan("ab\x1b[?2026hcd");
+    eq(s.syncOpen, true, "scan: unclosed block is open");
+    eq(s.blocks[0][0], 2, "scan: open block starts after the prefix");
+    eq(s.blocks[0][1], Infinity, "scan: open block has no end yet");
+    eq(planOutFeed(9, s.blocks, CAP, EXT), 2, "plan: an open tail block feeds only its prefix");
+    eq(planOutFeed(5000, [[0, Infinity]], CAP, EXT), 0, "plan: an open head block holds everything");
+  }
+  // Sequences split across chunks are still recognized.
+  {
+    const s = new SyncScan();
+    s.scan("\x1b[?202");
+    eq(s.blocks.length, 0, "scan: a split open is not yet a block");
+    s.scan("6h");
+    eq(s.blocks.length, 1, "scan: a split open completes across chunks");
+    s.scan("xx\x1b[?202");
+    s.scan("6l");
+    eq(s.blocks[0][1], 18, "scan: a split close completes across chunks");
+    eq(s.syncOpen, false, "scan: split close closes the block");
+  }
+  // ?2026 bytes inside a string are content, not a block (TermCore
+  // swallows them the same way: an ESC inside a string only ends it
+  // when followed by "\\").
+  {
+    const s = new SyncScan();
+    s.scan("\x1b]0;title\x1b[?2026h\x07");
+    eq(s.blocks.length, 0, "scan: ?2026 inside an OSC string is not a block");
+    const s2 = new SyncScan();
+    s2.scan("\x1bPz\x1b[?2026h\x1b\\");
+    eq(s2.blocks.length, 0, "scan: ?2026 inside a DCS string is not a block");
+    const s3 = new SyncScan();
+    s3.scan("\x1b]0;t\x1b\\" + "\x1b[?2026h");
+    eq(s3.blocks.length, 1, "scan: a block after an ST-terminated string is seen");
+    eq(s3.blocks[0][0], 7, "scan: block offset counts the string bytes");
+  }
+  // Multi-parameter mode sequences: only a list containing 2026 counts.
+  {
+    const s = new SyncScan();
+    s.scan("\x1b[?2026;1006h");
+    eq(s.syncOpen, true, "scan: ?2026;1006h opens");
+    s.scan("\x1b[?1006l");
+    eq(s.syncOpen, true, "scan: ?1006l alone does not close");
+    s.scan("\x1b[?2026l");
+    eq(s.syncOpen, false, "scan: ?2026l closes");
+    const s2 = new SyncScan();
+    s2.scan("\x1b[?2026h\x1b[?2026h\x1b[?2026l");
+    eq(s2.blocks.length, 1, "scan: a repeated open is one block (transitions only)");
+  }
+  // planOutFeed at the cap boundary.
+  {
+    eq(planOutFeed(70000, [[0, 70000]], CAP, EXT), 70000,
+       "plan: a frame ending within extend past the cap feeds whole");
+    eq(planOutFeed(200000, [[0, 200000]], CAP, EXT), CAP,
+       "plan: a giant closed frame slices at the cap");
+    eq(planOutFeed(1000, [[100, 200]], 150, EXT), 100,
+       "plan: cap inside a later block feeds the prefix first");
+    eq(planOutFeed(1000, [[100, 200]], CAP, EXT), 1000,
+       "plan: a block ending before the cap does not limit the feed");
+  }
+  // consume() shifts the spans of partially fed blocks.
+  {
+    const s = new SyncScan();
+    s.scan("0123456789\x1b[?2026hAB\x1b[?2026l");
+    s.consume(10);
+    eq(s.blocks[0][0], 0, "scan: consume shifts a block start to the head");
+    eq(s.blocks[0][1], 18, "scan: consume shifts a block end");
+  }
+  // Cross-check against TermCore: chunked feeding along the scanner's
+  // plan reaches the same screen as one whole feed.
+  {
+    const stream = "pre\x1b[?2026h\x1b[H\x1b[38;5;75mframe one\x1b[K\x1b[?2026l" +
+                   "mid\x1b]0;title\x07\x1b[?2026h\x1b[Hframe two\x1b[?2026lpost";
+    const whole = new TermCore(40, 5);
+    whole.feed(stream);
+    const s = new SyncScan();
+    const chunked = new TermCore(40, 5);
+    let rest = stream;
+    s.scan(rest);
+    let guard = 0;
+    while (rest.length && guard++ < 50) {
+      const n = planOutFeed(rest.length, s.blocks, 16, 16);
+      if (n <= 0) break;
+      chunked.feed(rest.slice(0, n));
+      s.consume(n);
+      rest = rest.slice(n);
+    }
+    eq(rest.length, 0, "scan/plan: the whole stream is feedable in slices");
+    eq(chunked.screenText(), whole.screenText(), "scan/plan: sliced feeding matches whole feeding");
+    eq(chunked.syncClosed, whole.syncClosed, "scan/plan: block closes are counted the same");
+  }
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

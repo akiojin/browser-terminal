@@ -861,6 +861,154 @@ function planWheelSend(accPx, lineH, maxSteps, gestureStart) {
   if (steps > maxSteps) steps = maxSteps; else if (steps < -maxSteps) steps = -maxSteps;
   return { steps, restPx: accPx - steps * lineH };
 }
+class SyncScan {
+  // Incremental scan of the not-yet-fed output stream for ?2026
+  // synchronized-update blocks. The receive path batches output before
+  // TermCore sees it (see the flush logic in the UI script); to feed
+  // whole frames it must know where blocks begin and end in data
+  // TermCore has not parsed yet. The state machine mirrors TermCore's
+  // own sequence handling (a string swallows everything up to BEL or
+  // ST — an ESC inside it only ends it when followed by "\\"; ESC
+  // aborts a CSI; C0 bytes inside a CSI are ignored) so the two never
+  // disagree about whether a block is open. Positions are char offsets
+  // from the head of the pending buffer; consume() shifts them as the
+  // head is fed.
+  constructor() { this.reset(); }
+  reset() {
+    this.state = "ground"; // ground|esc|escx|csi|str|strEsc
+    this.syncOpen = false;
+    this.blocks = [];      // [start, end) per ?2026 block; end = Infinity while open
+    this.pos = 0;          // chars scanned from the buffer head
+    this.seqStart = 0;     // pos of the ESC that opened the current sequence
+    this.csiText = "";     // parameter bytes of the CSI in progress
+  }
+  scan(text) {
+    let i = 0;
+    const n = text.length;
+    while (i < n) {
+      if (this.state === "ground") {
+        const e = text.indexOf("\x1b", i);
+        if (e < 0) { this.pos += n - i; i = n; break; }
+        this.pos += e - i; i = e;
+        this.seqStart = this.pos;
+        this.pos++; i++;
+        this.state = "esc";
+      } else if (this.state === "esc") {
+        const c = text[i];
+        this.pos++; i++;
+        if (c === "[") { this.state = "csi"; this.csiText = ""; }
+        else if (c === "]" || c === "P" || c === "X" || c === "^" || c === "_") this.state = "str";
+        else if (c === "\x1b") this.seqStart = this.pos - 1; // stay in esc
+        else if (c >= " " && c <= "/") this.state = "escx";  // intermediates (charset, DECID, ...)
+        else this.state = "ground";                          // final byte / control: done
+      } else if (this.state === "escx") {
+        const c = text[i];
+        this.pos++; i++;
+        if (c >= "@" && c <= "~") this.state = "ground";
+        else if (c === "\x1b") { this.seqStart = this.pos - 1; this.state = "esc"; }
+      } else if (this.state === "csi") {
+        let j = i;
+        while (j < n && j - i <= 2048) {
+          const code = text.charCodeAt(j);
+          if (code >= 0x40 && code <= 0x7e) break; // final byte
+          if (code === 0x1b) break;                // ESC aborts the CSI
+          j++;                                     // params / intermediates / C0: consumed
+        }
+        const span = j - i;
+        for (let k = i; k < j; k++) {
+          const code = text.charCodeAt(k);
+          if (code >= 0x30 && code <= 0x3f) this.csiText += text[k];
+        }
+        this.pos += span; i = j;
+        if (span > 2048 || this.csiText.length > 1024) { // garbage, not a CSI: resync
+          this.csiText = ""; this.state = "ground";
+        } else if (j >= n) {
+          break; // the sequence continues in the next chunk
+        } else if (text.charCodeAt(j) === 0x1b) {
+          this.csiText = "";
+          this.seqStart = this.pos;
+          this.pos++; i++;
+          this.state = "esc";
+        } else {
+          const body = this.csiText;
+          this.csiText = "";
+          this.pos++; i++;
+          this.state = "ground";
+          this.onCsi(body, text[j]);
+        }
+      } else if (this.state === "str") {
+        // String content (OSC / DCS / APC / ...): ends at BEL or ST.
+        let j = i;
+        while (j < n && text[j] !== "\x1b" && text[j] !== "\x07") j++;
+        this.pos += j - i; i = j;
+        if (j >= n) break; // the string continues in the next chunk
+        if (text[j] === "\x07") { this.pos++; i++; this.state = "ground"; }
+        else if (j + 1 < n) {
+          // ESC inside a string: only ESC \ (ST) ends it; any other
+          // next byte is swallowed as content (TermCore does the same).
+          this.pos += 2; i += 2;
+          if (text[j + 1] === "\\") this.state = "ground";
+        } else {
+          this.seqStart = this.pos;
+          this.pos++; i++;
+          this.state = "strEsc"; // the deciding byte is in the next chunk
+        }
+      } else { // strEsc: the previous char was ESC inside a string
+        if (text[i] === "\\") { this.pos++; i++; this.state = "ground"; }
+        else this.state = "str"; // swallowed as content; do not consume here
+      }
+    }
+  }
+  onCsi(body, final) {
+    if (final !== "h" && final !== "l") return;
+    if (body.charAt(0) !== "?") return;
+    const parts = body.slice(1).split(";");
+    let has = false;
+    for (const p of parts) { if (parseInt(p, 10) === 2026) { has = true; break; } }
+    if (!has) return;
+    const set = final === "h";
+    if (set === this.syncOpen) return; // TermCore counts transitions only
+    this.syncOpen = set;
+    if (set) this.blocks.push([this.seqStart, Infinity]);
+    else if (this.blocks.length) this.blocks[this.blocks.length - 1][1] = this.pos;
+  }
+  consume(n) {
+    // n chars were fed from the head: drop/shift the recorded spans.
+    if (n <= 0) return;
+    this.pos -= n;
+    this.seqStart -= n;
+    const kept = [];
+    for (const b of this.blocks) {
+      if (b[1] <= n) continue; // fully fed
+      kept.push([Math.max(0, b[0] - n), b[1] === Infinity ? Infinity : b[1] - n]);
+    }
+    this.blocks = kept;
+  }
+}
+function planOutFeed(pendingLen, blocks, cap, extend) {
+  // How many chars of the pending output may be fed to TermCore now.
+  // The cut never lands inside a ?2026 block: a frame is fed whole or
+  // not yet (TermCore would hold the paint anyway, but feeding whole
+  // frames also keeps parse + paint at one pass per frame). If the cap
+  // falls inside a block, feeding stops at the block start — unless the
+  // block already starts at the head: a closed frame that ends within
+  // `extend` past the cap is still fed whole, and a giant closed frame
+  // is sliced at the cap (its paint stays held inside TermCore). A
+  // still-open head block feeds nothing (0): its close has not arrived.
+  if (pendingLen <= 0) return 0;
+  const limit = Math.min(pendingLen, cap);
+  for (let k = 0; k < blocks.length; k++) {
+    const s = blocks[k][0], e = blocks[k][1];
+    if (s >= limit) break;
+    if (limit >= e) continue;
+    // limit falls inside this block
+    if (s > 0) return s;                          // feed what precedes it first
+    if (e === Infinity) return 0;                 // head block still open: hold
+    if (e <= cap + extend) return Math.min(e, pendingLen); // finish the frame whole
+    return limit;                                 // giant closed frame: slice at the cap
+  }
+  return limit;
+}
 function errorBarAfterEvent(current, event) {
   // The error bar's next text. A server "error" event replaces the text;
   // a successful "session" event clears it; anything else (socket open /
@@ -1173,6 +1321,111 @@ function afterTermFeed(closedBefore) {
 }
 term.onResponse = (s) => sendInput(s);
 
+// --- output batching (receive path) -------------------------------------
+// Server output used to go straight into TermCore per WebSocket
+// message. A Codex full repaint is one ?2026 frame but arrives split
+// across many messages, so TermCore parsed — and, at each block close,
+// painted — many partial states per screenful (the mid-scroll smear).
+// gwt's client gets its smoothness from coalescing this path instead:
+// queue the text, flush it per animation frame in capped slices, and
+// feed ?2026 frames whole (planOutFeed). Paint scheduling itself is
+// unchanged: afterTermFeed still decides render vs hold per flush.
+const OUT_FEED_CAP = 64 * 1024;     // chars per TermCore.feed (gwt: 64K per write)
+const OUT_FRAME_EXTEND = 64 * 1024; // a frame ending this far past the cap is still fed whole
+const OUT_CATCHUP_MIN = 256 * 1024; // backlog that arms the catch-up drain (gwt #7553)
+const OUT_BUDGET_MS = 8;            // per-tick budget while catching up
+const OUT_HOLD_MS = 100;            // a ?2026 close missing this long is fed anyway
+const outScan = new SyncScan();
+let outChunks = [];      // decoded output strings not yet fed, in receive order
+let outLen = 0;          // total chars waiting in outChunks
+let outRaf = null;       // pending flush rAF handle
+let outTimer = null;     // pending flush fallback / hold timer handle
+let outHoldSince = 0;    // when the queue head started waiting for a ?2026 close
+let outFlushFailures = 0;
+function enqueueOutput(text) {
+  if (!text) return;
+  outChunks.push(text);
+  outLen += text.length;
+  outScan.scan(text);
+  kickOutFlush();
+}
+function kickOutFlush() {
+  if (outRaf !== null) return;
+  if (outTimer !== null) { clearTimeout(outTimer); outTimer = null; }
+  outRaf = requestAnimationFrame(flushOutput);
+  // rAF never fires in a hidden document; the timer is the fallback
+  // (gwt's scheduler does the same with a 100ms timer).
+  outTimer = setTimeout(flushOutput, 100);
+}
+function resetOutputQueue() {
+  // A (re)attach replays the full scrollback after term.resetAll();
+  // bytes still queued belong to the previous screen and must not land
+  // after the reset. A disconnect drops them for the same reason.
+  outChunks = [];
+  outLen = 0;
+  outScan.reset();
+  outHoldSince = 0;
+  if (outRaf !== null) { cancelAnimationFrame(outRaf); outRaf = null; }
+  if (outTimer !== null) { clearTimeout(outTimer); outTimer = null; }
+}
+function takeOut(n) {
+  let s = "";
+  while (n > 0 && outChunks.length) {
+    const head = outChunks[0];
+    if (head.length <= n) { s += head; n -= head.length; outChunks.shift(); }
+    else { s += head.slice(0, n); outChunks[0] = head.slice(n); n = 0; }
+  }
+  outLen -= s.length;
+  return s;
+}
+function flushOutput() {
+  if (outRaf !== null) { cancelAnimationFrame(outRaf); outRaf = null; }
+  if (outTimer !== null) { clearTimeout(outTimer); outTimer = null; }
+  if (!outLen) { outHoldSince = 0; return; }
+  const closedBefore = term.syncClosed;
+  const tickStart = performance.now();
+  let fed = 0;
+  try {
+    for (;;) {
+      let n = planOutFeed(outLen, outScan.blocks, OUT_FEED_CAP, OUT_FRAME_EXTEND);
+      if (n <= 0) {
+        // The queue head is an unfinished ?2026 frame: wait for its
+        // close — unless it has been missing for OUT_HOLD_MS, in which
+        // case feed what we have rather than stall the stream behind
+        // a lost close (the paint-side hold still guards the frame).
+        if (!outHoldSince) outHoldSince = tickStart;
+        if (tickStart - outHoldSince < OUT_HOLD_MS) break;
+        n = Math.min(outLen, OUT_FEED_CAP);
+        outHoldSince = 0;
+      } else {
+        outHoldSince = 0;
+      }
+      const s = takeOut(n);
+      outScan.consume(n);
+      term.feed(s);
+      fed += n;
+      if (!outLen) break;
+      // Base case is one slice per tick; while a big backlog remains,
+      // keep slicing inside the budget so a replay or burst catches up
+      // within a few frames instead of one cap per frame.
+      if (outLen < OUT_CATCHUP_MIN) break;
+      if (performance.now() - tickStart >= OUT_BUDGET_MS) break;
+    }
+    outFlushFailures = 0;
+  } catch (e) {
+    // A throwing feed must not strand the queue in silence: retry on
+    // the next tick, but drop the backlog after repeated failures
+    // rather than spin forever on a broken stream.
+    outFlushFailures++;
+    if (outFlushFailures >= 5) { resetOutputQueue(); outFlushFailures = 0; }
+  }
+  if (fed > 0) afterTermFeed(closedBefore);
+  if (outLen > 0) {
+    if (fed > 0) kickOutFlush();
+    else outTimer = setTimeout(flushOutput, Math.max(0, OUT_HOLD_MS - (performance.now() - outHoldSince)));
+  }
+}
+
 function measure() {
   const probe = document.createElement("div");
   probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;";
@@ -1286,6 +1539,7 @@ function connect() {
   sock.onclose = () => {
     if (ws !== sock) return;
     ws = null;
+    resetOutputQueue(); // the reattach replays scrollback; queued bytes are stale
     setStatus("disconnected", false);
     planReconnect();
   };
@@ -1301,6 +1555,8 @@ function connect() {
           applyErrorBar(errorBarAfterEvent(lastErrorText, msg));
           // Fresh attach: the server replays scrollback, so reset the grid
           // first to restore the screen exactly (no duplicated history).
+          // Queued output from the previous screen goes with it.
+          resetOutputQueue();
           term.resetAll();
           viewOffset = 0;
           setStatus("connected — " + msg.name + (msg.alive ? "" : " (exited)"), true);
@@ -1319,13 +1575,9 @@ function connect() {
         }
         return;
       } catch (e) { /* not JSON: render as terminal output */ }
-      const closedBeforeS = term.syncClosed;
-      term.feed(ev.data);
-      afterTermFeed(closedBeforeS);
+      enqueueOutput(ev.data);
     } else {
-      const closedBeforeB = term.syncClosed;
-      term.feed(decoder.decode(new Uint8Array(ev.data), { stream: true }));
-      afterTermFeed(closedBeforeB);
+      enqueueOutput(decoder.decode(new Uint8Array(ev.data), { stream: true }));
     }
   };
 }
