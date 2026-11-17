@@ -16,6 +16,7 @@ const { parseOsc7Payload, createOsc7Tracker, readProcCwd, parseLsofCwd } = requi
 const { idleTimeoutMs, isIdle, sweepIntervalMs } = require("../src/idle");
 const { launchAgentPlist, systemdUnit, servicePlan, LAUNCHD_LABEL } = require("../src/service-helper");
 const { shellArgs } = require("../src/shell");
+const { scrollbackCutOffset, trimScrollback } = require("../src/scrollback");
 
 let failures = 0;
 function eq(actual, expected, name) {
@@ -142,6 +143,60 @@ function ok(cond, name) { eq(!!cond, true, name); }
       fs.rmSync(home, { recursive: true, force: true });
     }
   }
+}
+
+// --- scrollback trim: replay must start at a parser ground point -------------
+{
+  const small = Buffer.from("x".repeat(50));
+  eq(scrollbackCutOffset(small, 100), 0, "trim: under cap keeps everything");
+  eq(trimScrollback(small, 100).length, 50, "trim: under cap returns the buffer");
+
+  const ascii = Buffer.from("x".repeat(300));
+  eq(scrollbackCutOffset(ascii, 100), 200, "trim: plain text cuts at the cap target");
+  eq(trimScrollback(ascii, 100).length, 100, "trim: plain text keeps exactly cap bytes");
+
+  // "あ" is 3 bytes (E3 81 82): byte 200 is the third byte of a char.
+  const wide = Buffer.from("あ".repeat(100), "utf8");
+  eq(scrollbackCutOffset(wide, 100), 201, "trim: cut lands on a UTF-8 character boundary");
+  eq(trimScrollback(wide, 100).toString("utf8"), "あ".repeat(33), "trim: no mojibake at the cut");
+
+  // Target falls inside a CSI: the tail must not print as literal text.
+  const csi = Buffer.from("x".repeat(250) + "\x1b[38;5;196mCOLOR", "utf8");
+  eq(trimScrollback(csi, 13).toString("utf8"), "COLOR", "trim: mid-CSI cut skips to the sequence end");
+
+  // Target falls inside an OSC (window title): skip to its terminator.
+  const osc = Buffer.from("y".repeat(100) + "\x1b]0;TITLE\x07" + "z".repeat(50), "utf8");
+  eq(trimScrollback(osc, 55).toString("utf8"), "z".repeat(50), "trim: mid-OSC cut skips to the terminator");
+
+  // The whole tail lives inside the alt screen: keep the entry sequence
+  // so the replay enters the alt screen instead of baking TUI frames
+  // onto the main grid (bt-freeze-repro/repro-c-replay-trim.js, C1).
+  const head = "shell$ codex\r\n";
+  const enter = "\x1b[?1049h";
+  const frame = "\x1b[H\x1b[2J" + "TUI-FRAME-1" + "\x1b[3;1H" + "status: working";
+  const filler = ("\x1b[3;9H" + "working ").repeat(30);
+  const full = Buffer.from(head + enter + frame + filler, "utf8");
+  const trimmed = trimScrollback(full, 200);
+  eq(trimmed.subarray(0, enter.length).toString("utf8"), enter,
+     "trim: alt-screen tail keeps the entry sequence");
+
+  const html = fs.readFileSync(path.join(__dirname, "..", "src", "ui.html"), "utf8");
+  const TermCore = new Function(
+    html.slice(html.indexOf("/* === TERM-CORE-BEGIN === */"), html.indexOf("/* === TERM-CORE-END === */")) +
+    "\nreturn TermCore;")();
+  const live = new TermCore(40, 6);
+  live.feed(full.toString("utf8"));
+  const replay = new TermCore(40, 6);
+  replay.feed(trimmed.toString("utf8"));
+  eq(replay.altActive, true, "trim: replayed stream enters the alt screen");
+  eq(replay.altActive, live.altActive, "trim: replayed alt state matches the live client");
+  eq(replay.lineText(0), live.lineText(0), "trim: replayed alt frame matches the live client");
+  live.feed("\x1b[?1049l");
+  replay.feed("\x1b[?1049l");
+  eq(live.lineText(0), "shell$ codex", "trim: live client returns to the shell on alt exit");
+  // The replay never received the (trimmed-away) shell prompt, so its
+  // main screen is blank — the point is that no TUI frame stays baked in.
+  eq(replay.lineText(0), "", "trim: no TUI frame baked into the replayed main screen");
 }
 
 // --- Integration: real server ---------------------------------------------------

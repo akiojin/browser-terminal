@@ -942,7 +942,6 @@ function applyErrorBar(text) {
   errbar.classList.toggle("show", !!lastErrorText);
 }
 document.getElementById("errdismiss").onclick = () => applyErrorBar("");
-const decoder = new TextDecoder("utf-8");
 let ws = null;
 function setStatus(text, on) {
   statusEl.textContent = text;
@@ -954,6 +953,9 @@ function connect() {
   q.set("session", sessionId || "new");
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?" + q);
   ws.binaryType = "arraybuffer";
+  // Fresh decoder per connection: a shared one would leak an unfinished
+  // multi-byte sequence from the previous connection into this replay.
+  const decoder = new TextDecoder("utf-8");
   setStatus("connecting…", null);
   ws.onopen = () => { setStatus("connected", true); const m = measure(); sendResize(m.cols, m.rows); requestRender(); ime.focus({ preventScroll: true }); };
   ws.onclose = () => setStatus("disconnected", false);

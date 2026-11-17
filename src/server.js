@@ -21,6 +21,7 @@ const { parse: parseToml } = require('smol-toml');
 const { repairNodePtySpawnHelpers, probePtySpawn } = require('./spawn-helper');
 const { createOsc7Tracker, readProcCwd, parseLsofCwd } = require('./cwd');
 const { idleTimeoutMs, isIdle, sweepIntervalMs } = require('./idle');
+const { trimScrollback } = require('./scrollback');
 const { shellArgs } = require('./shell');
 
 // ---------------------------------------------------------------------------
@@ -287,7 +288,7 @@ function createSession(name) {
     if (oscCwd) setSessionCwd(session, oscCwd);
     const chunk = Buffer.from(data, 'utf8');
     let sb = Buffer.concat([session.scrollback, chunk]);
-    if (sb.length > cap) sb = sb.subarray(sb.length - cap);
+    if (sb.length > cap) sb = trimScrollback(sb, cap);
     session.scrollback = sb;
 
     const plain = stripAnsi(data);
