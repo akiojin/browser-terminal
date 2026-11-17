@@ -217,7 +217,7 @@ async function integration() {
   ].join("\n"));
 
   const child = spawn(process.execPath, [path.join(__dirname, "..", "src", "server.js"), "--config", cfgPath],
-    { stdio: ["ignore", "pipe", "pipe"] });
+    { stdio: ["ignore", "pipe", "pipe"], cwd: tmp });
   let serverLog = "";
   child.stdout.on("data", (d) => { serverLog += d; });
   child.stderr.on("data", (d) => { serverLog += d; });
@@ -239,6 +239,33 @@ async function integration() {
     ok(up, "integration: server started");
     if (!up) { console.log(serverLog); return; }
     ok(serverLog.includes("session idle timeout"), "integration: idle timeout announced in log");
+
+    // /perf: token-gated like the other UI endpoints; a valid snapshot
+    // is appended as one JSON line to perf.log in the server's cwd.
+    const perfPayload = { kind: "bt-perf", renders: { count: 3 }, feeds: { bytes: 42 } };
+    const perfNoAuth = await fetch(`${base}/perf`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(perfPayload),
+    });
+    eq(perfNoAuth.status, 401, "integration: /perf without token -> 401");
+    const perfRes = await fetch(`${base}/perf?token=${encodeURIComponent(token)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(perfPayload),
+    });
+    eq(perfRes.status, 200, "integration: /perf with token -> 200");
+    const perfLines = fs.readFileSync(path.join(tmp, "perf.log"), "utf8").trim().split("\n");
+    eq(perfLines.length, 1, "integration: /perf appended exactly one line");
+    const perfEntry = JSON.parse(perfLines[0]);
+    ok(typeof perfEntry.server_ts === "string" && perfEntry.server_ts.length > 0,
+       "integration: /perf line carries the server timestamp");
+    eq(perfEntry.renders.count, 3, "integration: /perf line preserves the snapshot body");
+    eq(perfEntry.feeds.bytes, 42, "integration: /perf line preserves nested fields");
+    const perfBad = await fetch(`${base}/perf?token=${encodeURIComponent(token)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{not json",
+    });
+    eq(perfBad.status, 400, "integration: /perf with invalid JSON -> 400");
+    eq(fs.readFileSync(path.join(tmp, "perf.log"), "utf8").trim().split("\n").length, 1,
+       "integration: rejected /perf posts append nothing");
 
     const createRes = await fetch(`${base}/api/sessions`, {
       method: "POST", headers, body: JSON.stringify({ name: "integ" }),

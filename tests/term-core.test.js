@@ -821,5 +821,89 @@ function splitAfter(s, marker) { // [through marker, rest]
   }
 }
 
+// 35. UI helpers: perf instrumentation aggregation (?perf=1). The frame
+// buckets, UTF-8 byte counting and the window aggregator are pure, so
+// they are driven here with synthetic values; the render counters are
+// the H1/H2 probes (target = rows render() had to decide on, rebuilt =
+// rows paintRow() actually rebuilt, sigHit = the difference).
+{
+  const hBegin = html.indexOf("/* === UI-HELPERS-BEGIN === */");
+  const hEnd = html.indexOf("/* === UI-HELPERS-END === */");
+  const helpers = new Function(html.slice(hBegin, hEnd) +
+    "\nreturn { perfFrameBucket, utf8ByteLength, PerfAgg };")();
+
+  eq(helpers.perfFrameBucket(0), 0, "perf bucket: 0ms -> 0");
+  eq(helpers.perfFrameBucket(16.7), 0, "perf bucket: 16.7ms -> 0 (boundary)");
+  eq(helpers.perfFrameBucket(16.8), 1, "perf bucket: 16.8ms -> 1");
+  eq(helpers.perfFrameBucket(33), 1, "perf bucket: 33ms -> 1 (boundary)");
+  eq(helpers.perfFrameBucket(33.1), 2, "perf bucket: 33.1ms -> 2");
+  eq(helpers.perfFrameBucket(50), 2, "perf bucket: 50ms -> 2 (boundary)");
+  eq(helpers.perfFrameBucket(50.1), 3, "perf bucket: 50.1ms -> 3");
+  eq(helpers.perfFrameBucket(100), 3, "perf bucket: 100ms -> 3 (boundary)");
+  eq(helpers.perfFrameBucket(100.1), 4, "perf bucket: 100.1ms -> 4");
+  eq(helpers.perfFrameBucket(5000), 4, "perf bucket: huge -> 4");
+
+  eq(helpers.utf8ByteLength(""), 0, "utf8: empty");
+  eq(helpers.utf8ByteLength("abc\x1b[0m"), 7, "utf8: ASCII + escapes count 1 each");
+  eq(helpers.utf8ByteLength("é"), 2, "utf8: 2-byte char");
+  eq(helpers.utf8ByteLength("あ"), 3, "utf8: 3-byte char");
+  eq(helpers.utf8ByteLength("😀"), 4, "utf8: surrogate pair counts 4, not 6");
+  eq(helpers.utf8ByteLength("aあb"), 5, "utf8: mixed widths");
+
+  const agg = new helpers.PerfAgg(1000);
+  agg.noteFrameInterval(16.7);
+  agg.noteFrameInterval(20);
+  agg.noteFrameInterval(120);
+  agg.noteFrameInterval(-5); // clock noise: ignored
+  agg.noteLongTask(80);
+  agg.noteLongTask(55.25);
+  agg.noteRender(12.34, 60, 60); // H1 shape: every target row rebuilt
+  agg.noteRender(3, 10, 4);       // signature fallback rescued 6 rows
+  agg.noteFeed(100, 100);
+  agg.noteFeed(10, 30);
+  const snap = agg.snapshot({
+    cols: 235, rows: 60, dpr: 2, visibilityChanges: 1,
+    longtaskSupported: true, final: false, clientTs: "2026-11-18T00:00:00.000Z",
+  }, 6000);
+  eq(snap.kind, "bt-perf", "perf snap: kind tag");
+  eq(snap.windowMs, 5000, "perf snap: window length");
+  eq(snap.cols, 235, "perf snap: cols carried from meta");
+  eq(snap.rows, 60, "perf snap: rows carried from meta");
+  eq(snap.dpr, 2, "perf snap: dpr carried from meta");
+  eq(snap.visibilityChanges, 1, "perf snap: visibility changes carried");
+  eq(snap.longtaskSupported, true, "perf snap: longtask support flag");
+  eq(snap.final, false, "perf snap: final flag");
+  eq(snap.frames.count, 3, "perf snap: negative interval ignored");
+  eq(JSON.stringify(snap.frames.hist), JSON.stringify([1, 1, 0, 0, 1]), "perf snap: frame histogram");
+  eq(snap.frames.maxMs, 120, "perf snap: frame max");
+  eq(snap.longtasks.count, 2, "perf snap: longtask count");
+  eq(snap.longtasks.totalMs, 135.3, "perf snap: longtask total (0.1ms rounding)");
+  eq(snap.longtasks.maxMs, 80, "perf snap: longtask max");
+  eq(snap.renders.count, 2, "perf snap: render count");
+  eq(snap.renders.totalMs, 15.3, "perf snap: render total (0.1ms rounding)");
+  eq(snap.renders.maxMs, 12.3, "perf snap: render max");
+  eq(snap.renders.targetRowsTotal, 70, "perf snap: target rows total");
+  eq(snap.renders.targetRowsMax, 60, "perf snap: target rows max");
+  eq(snap.renders.rebuiltRowsTotal, 64, "perf snap: rebuilt rows total");
+  eq(snap.renders.rebuiltRowsMax, 60, "perf snap: rebuilt rows max");
+  eq(snap.renders.sigHitRowsTotal, 6, "perf snap: sig hits = target - rebuilt");
+  eq(snap.feeds.count, 2, "perf snap: feed count");
+  eq(snap.feeds.chars, 110, "perf snap: feed chars");
+  eq(snap.feeds.bytes, 130, "perf snap: feed bytes");
+
+  // snapshot() resets the window: a second snapshot is all zeros and
+  // its window starts where the first one ended.
+  const snap2 = agg.snapshot({
+    cols: 235, rows: 60, dpr: 2, visibilityChanges: 0,
+    longtaskSupported: false, final: true, clientTs: "2026-11-18T00:00:05.000Z",
+  }, 11000);
+  eq(snap2.windowMs, 5000, "perf snap2: window restarts at previous snapshot");
+  eq(snap2.frames.count, 0, "perf snap2: counters reset");
+  eq(snap2.renders.count, 0, "perf snap2: renders reset");
+  eq(snap2.feeds.bytes, 0, "perf snap2: feeds reset");
+  eq(snap2.longtaskSupported, false, "perf snap2: unsupported longtask recorded as false");
+  eq(snap2.final, true, "perf snap2: final flag set");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

@@ -1021,6 +1021,110 @@ function errorBarAfterEvent(current, event) {
   if (event.type === "error") return formatSessionError(event.message);
   return cur;
 }
+function perfFrameBucket(ms) {
+  // Histogram bucket for a requestAnimationFrame interval:
+  // <=16.7 / <=33 / <=50 / <=100 / >100 (indices 0..4).
+  if (ms <= 16.7) return 0;
+  if (ms <= 33) return 1;
+  if (ms <= 50) return 2;
+  if (ms <= 100) return 3;
+  return 4;
+}
+function utf8ByteLength(s) {
+  // UTF-8 byte length of a JS string. The feed accounting counts bytes,
+  // not UTF-16 code units; a surrogate pair is one 4-byte character.
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c >= 0xd800 && c <= 0xdbff) { bytes += 4; i++; }
+    else bytes += 3;
+  }
+  return bytes;
+}
+class PerfAgg {
+  // Aggregates one reporting window of the ?perf=1 client counters.
+  // Pure bookkeeping (no DOM, no timers) so tests can drive it with
+  // synthetic values; snapshot() emits the window and resets it.
+  // The render counters exist to test the render-hotspot hypotheses:
+  // targetRows is how many rows render() had to decide on (the rows
+  // that missed the identity+version fast path), rebuiltRows how many
+  // it actually repainted through paintRow(). H1 predicts rebuilt ~=
+  // target ~= rows during a full-repaint scroll; H2 predicts the gap
+  // (signature hits, reported as sigHitRowsTotal) stays near zero then,
+  // i.e. the signature scan runs without rescuing anything.
+  constructor(startMs) { this.reset(startMs || 0); }
+  reset(startMs) {
+    this.startMs = startMs;
+    this.frameCount = 0;
+    this.frameHist = [0, 0, 0, 0, 0];
+    this.frameMaxMs = 0;
+    this.longtaskCount = 0;
+    this.longtaskTotalMs = 0;
+    this.longtaskMaxMs = 0;
+    this.renderCount = 0;
+    this.renderTotalMs = 0;
+    this.renderMaxMs = 0;
+    this.targetRowsTotal = 0;
+    this.targetRowsMax = 0;
+    this.rebuiltRowsTotal = 0;
+    this.rebuiltRowsMax = 0;
+    this.feedCount = 0;
+    this.feedChars = 0;
+    this.feedBytes = 0;
+  }
+  noteFrameInterval(ms) {
+    if (!(ms >= 0)) return; // negative / NaN intervals are clock noise
+    this.frameCount++;
+    this.frameHist[perfFrameBucket(ms)]++;
+    if (ms > this.frameMaxMs) this.frameMaxMs = ms;
+  }
+  noteLongTask(durationMs) {
+    this.longtaskCount++;
+    this.longtaskTotalMs += durationMs;
+    if (durationMs > this.longtaskMaxMs) this.longtaskMaxMs = durationMs;
+  }
+  noteRender(durationMs, targetRows, rebuiltRows) {
+    this.renderCount++;
+    this.renderTotalMs += durationMs;
+    if (durationMs > this.renderMaxMs) this.renderMaxMs = durationMs;
+    this.targetRowsTotal += targetRows;
+    if (targetRows > this.targetRowsMax) this.targetRowsMax = targetRows;
+    this.rebuiltRowsTotal += rebuiltRows;
+    if (rebuiltRows > this.rebuiltRowsMax) this.rebuiltRowsMax = rebuiltRows;
+  }
+  noteFeed(chars, bytes) {
+    this.feedCount++;
+    this.feedChars += chars;
+    this.feedBytes += bytes;
+  }
+  snapshot(meta, nowMs) {
+    const r1 = (v) => Math.round(v * 10) / 10;
+    const out = {
+      kind: "bt-perf",
+      clientTs: meta.clientTs,
+      windowMs: Math.round(nowMs - this.startMs),
+      cols: meta.cols,
+      rows: meta.rows,
+      dpr: meta.dpr,
+      visibilityChanges: meta.visibilityChanges,
+      longtaskSupported: !!meta.longtaskSupported,
+      final: !!meta.final,
+      frames: { count: this.frameCount, hist: this.frameHist.slice(), maxMs: r1(this.frameMaxMs) },
+      longtasks: { count: this.longtaskCount, totalMs: r1(this.longtaskTotalMs), maxMs: r1(this.longtaskMaxMs) },
+      renders: {
+        count: this.renderCount, totalMs: r1(this.renderTotalMs), maxMs: r1(this.renderMaxMs),
+        targetRowsTotal: this.targetRowsTotal, targetRowsMax: this.targetRowsMax,
+        rebuiltRowsTotal: this.rebuiltRowsTotal, rebuiltRowsMax: this.rebuiltRowsMax,
+        sigHitRowsTotal: this.targetRowsTotal - this.rebuiltRowsTotal,
+      },
+      feeds: { count: this.feedCount, chars: this.feedChars, bytes: this.feedBytes },
+    };
+    this.reset(nowMs);
+    return out;
+  }
+}
 /* === UI-HELPERS-END === */
 
 // --- token handling -------------------------------------------------------
@@ -1033,6 +1137,65 @@ if (params.get("token")) {
   history.replaceState(null, "", location.pathname + (params.toString() ? "?" + params : ""));
 }
 let sessionId = params.get("session") || null;
+
+// --- perf instrumentation (only with ?perf=1) -------------------------------
+// Off unless the URL carries perf=1: no observers, no timers, no posts,
+// and the render/feed hooks below stay null-checked no-ops, so normal
+// use is unchanged. When on, the client aggregates rAF frame intervals,
+// long tasks, render cost (including the target/rebuilt row counts the
+// hotspot hypotheses H1/H2 key on) and feed volume, posts a snapshot to
+// /perf every 5s — the server appends it to perf.log — and flushes the
+// final window via sendBeacon on pagehide. This is how a real-machine
+// scroll session gets measured without DevTools or script injection.
+const PERF_ON = params.get("perf") === "1";
+let perfAgg = null;
+let perfLongtaskSupported = false;
+let perfVisChanges = 0;
+function perfSend(final) {
+  if (!perfAgg) return;
+  const snap = perfAgg.snapshot({
+    cols: term.cols, rows: term.rows,
+    dpr: window.devicePixelRatio || 1,
+    visibilityChanges: perfVisChanges,
+    longtaskSupported: perfLongtaskSupported,
+    final: !!final,
+    clientTs: new Date().toISOString(),
+  }, performance.now());
+  perfVisChanges = 0;
+  const body = JSON.stringify(snap);
+  const url = "/perf?token=" + encodeURIComponent(token);
+  if (final && navigator.sendBeacon) {
+    try {
+      if (navigator.sendBeacon(url, new Blob([body], { type: "application/json" }))) return;
+    } catch (e) { /* fall through to fetch */ }
+  }
+  fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    keepalive: !!final,
+  }).catch(() => {});
+}
+if (PERF_ON) {
+  perfAgg = new PerfAgg(performance.now());
+  let perfLastRafTs = 0;
+  const perfRafLoop = (ts) => {
+    if (perfLastRafTs) perfAgg.noteFrameInterval(ts - perfLastRafTs);
+    perfLastRafTs = ts;
+    requestAnimationFrame(perfRafLoop);
+  };
+  requestAnimationFrame(perfRafLoop);
+  try {
+    const po = new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) perfAgg.noteLongTask(e.duration);
+    });
+    po.observe({ entryTypes: ["longtask"] });
+    perfLongtaskSupported = true;
+  } catch (e) { /* longtask unsupported here: snapshots record false */ }
+  document.addEventListener("visibilitychange", () => { perfVisChanges++; });
+  setInterval(() => perfSend(false), 5000);
+  window.addEventListener("pagehide", () => perfSend(true));
+}
 
 // --- terminal + rendering ---------------------------------------------------
 const termwrap = document.getElementById("termwrap");
@@ -1176,6 +1339,7 @@ function paintRow(rowEl, rowArr, cursorX) {
   if (rowEl.childElementCount === 0) rowEl.textContent = " ";
 }
 function render() {
+  const perfT0 = perfAgg ? performance.now() : 0;
   renderQueued = false;
   rafHandle = null;
   // Keep the viewed window stable while new lines land in scrollback.
@@ -1206,6 +1370,7 @@ function render() {
   const rowEls = new Array(term.rows);
   const claimed = new Set();
   const pending = []; // rows that need a repaint: [y, rowArr, cursorX]
+  let perfRebuiltRows = 0; // rows paintRow() actually rebuilds (perf only)
   for (let y = 0; y < term.rows; y++) {
     const rowArr = combinedRow(base + y);
     const cursorX = showCursor && y === term.cy ? term.cx : -1;
@@ -1244,6 +1409,7 @@ function render() {
         toPaint.push([y, rowArr, cursorX, sig]);
       }
     }
+    perfRebuiltRows = toPaint.length;
     if (toPaint.length) {
       const spares = [];
       for (const el of termEl.children) if (!claimed.has(el)) spares.push(el);
@@ -1284,6 +1450,7 @@ function render() {
     preeditEl.style.display = "none";
   }
   lastPaintAt = performance.now();
+  if (perfAgg) perfAgg.noteRender(lastPaintAt - perfT0, pending.length, perfRebuiltRows);
 }
 function requestRender() {
   if (!renderQueued) { renderQueued = true; rafHandle = requestAnimationFrame(render); }
@@ -1403,6 +1570,7 @@ function flushOutput() {
       const s = takeOut(n);
       outScan.consume(n);
       term.feed(s);
+      if (perfAgg) perfAgg.noteFeed(s.length, utf8ByteLength(s));
       fed += n;
       if (!outLen) break;
       // Base case is one slice per tick; while a big backlog remains,

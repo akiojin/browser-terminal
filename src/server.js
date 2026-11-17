@@ -516,6 +516,29 @@ async function handleHttp(req, res) {
     return sendJson(res, 200, { ok: true });
   }
 
+  // POST /perf — client perf snapshots (the UI sends these only with
+  // ?perf=1). Each snapshot is appended as one JSON line to perf.log in
+  // the server's working directory, stamped with the server's clock.
+  if (req.method === 'POST' && pathname === '/perf') {
+    if (!authorized(req.headers, queryToken)) return sendEmpty(res, 401);
+    const declared = Number(req.headers['content-length'] || 0);
+    if (declared > 64 * 1024) return sendEmpty(res, 413);
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (_) {
+      return sendEmpty(res, 400);
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return sendEmpty(res, 400);
+    const line = JSON.stringify(Object.assign({ server_ts: nowRfc3339() }, body)) + '\n';
+    try {
+      fs.appendFileSync(path.join(process.cwd(), 'perf.log'), line);
+    } catch (_) {
+      return sendEmpty(res, 500);
+    }
+    return sendJson(res, 200, { ok: true });
+  }
+
   // ---- Agent API (only when api_enabled = true) ----
 
   if (req.method === 'GET' && pathname === '/api/sessions') {
