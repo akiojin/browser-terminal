@@ -431,16 +431,26 @@ function authorized(headers, queryToken) {
   return false;
 }
 
-const TOKEN_FORM = `<!DOCTYPE html>
+// The gate form submits via GET to "/", so only fields present in the
+// form survive the submit. A request for /?perf=1 must keep perf=1
+// across that hop (as a hidden field), or the terminal page loads
+// without it and perf measurement never starts. Other query
+// parameters are not carried over.
+function tokenForm(searchParams) {
+  const perfField = searchParams && searchParams.get('perf') === '1'
+    ? '<input type="hidden" name="perf" value="1">\n'
+    : '';
+  return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>browser-terminal</title></head>
 <body style="font-family:monospace;background:#111;color:#ddd;padding:2em">
 <h1>browser-terminal</h1>
 <p>Access token required.</p>
 <form method="GET" action="/">
-<label>Token: <input type="password" name="token" size="48"></label>
+${perfField}<label>Token: <input type="password" name="token" size="48"></label>
 <button type="submit">Open terminal</button>
 </form>
 </body></html>`;
+}
 
 let UI_HTML = '';
 
@@ -491,7 +501,7 @@ async function handleHttp(req, res) {
   if (req.method === 'GET' && pathname === '/') {
     if (!authorized(req.headers, queryToken)) {
       res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(TOKEN_FORM);
+      res.end(tokenForm(url.searchParams));
       return;
     }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });

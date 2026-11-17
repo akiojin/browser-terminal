@@ -267,6 +267,25 @@ async function integration() {
     eq(fs.readFileSync(path.join(tmp, "perf.log"), "utf8").trim().split("\n").length, 1,
        "integration: rejected /perf posts append nothing");
 
+    // Token gate: the form submits via GET to "/", so only fields in
+    // the form survive. A /?perf=1 request must carry perf=1 through
+    // the submit as a hidden field, or the terminal page loads without
+    // it and perf measurement never starts.
+    const gatePerf = await fetch(`${base}/?perf=1`);
+    eq(gatePerf.status, 401, "integration: gate for /?perf=1 -> 401");
+    ok((await gatePerf.text()).includes('<input type="hidden" name="perf" value="1">'),
+       "integration: gate for /?perf=1 keeps perf as a hidden field");
+    const gatePlain = await fetch(`${base}/`);
+    eq(gatePlain.status, 401, "integration: gate for / -> 401");
+    ok(!(await gatePlain.text()).includes('name="perf"'),
+       "integration: gate for / has no perf field");
+    const gatePerf0 = await fetch(`${base}/?perf=0`);
+    eq(gatePerf0.status, 401, "integration: gate for /?perf=0 -> 401");
+    ok(!(await gatePerf0.text()).includes('name="perf"'),
+       "integration: gate preserves only perf=1, not perf=0");
+    const gateAuth = await fetch(`${base}/?perf=1&token=${encodeURIComponent(token)}`);
+    eq(gateAuth.status, 200, "integration: authorized /?perf=1 -> 200 (UI served, no gate)");
+
     const createRes = await fetch(`${base}/api/sessions`, {
       method: "POST", headers, body: JSON.stringify({ name: "integ" }),
     });

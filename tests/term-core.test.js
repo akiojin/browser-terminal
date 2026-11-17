@@ -905,5 +905,27 @@ function splitAfter(s, marker) { // [through marker, rest]
   eq(snap2.final, true, "perf snap2: final flag set");
 }
 
+// 36. UI helpers: perf enablement (perfOnFor). ?perf=1 is the entry
+// point; once seen, the main script latches it into sessionStorage
+// (bt_perf) because the token gate's GET form drops the query on
+// submit, and the load after the gate must still measure. The pure
+// decision is: on iff the parameter is exactly "1" or the latched
+// flag is exactly "1"; anything else is off.
+{
+  const hBegin = html.indexOf("/* === UI-HELPERS-BEGIN === */");
+  const hEnd = html.indexOf("/* === UI-HELPERS-END === */");
+  const helpers = new Function(html.slice(hBegin, hEnd) +
+    "\nreturn { perfOnFor };")();
+
+  eq(helpers.perfOnFor("1", null), true, "perf on: ?perf=1 in the URL");
+  eq(helpers.perfOnFor("1", "1"), true, "perf on: param and latched flag");
+  eq(helpers.perfOnFor(null, "1"), true, "perf on: latched flag survives the gate hop (param gone)");
+  eq(helpers.perfOnFor(null, null), false, "perf off: no param, no flag (normal use)");
+  eq(helpers.perfOnFor(null, "0"), false, "perf off: stored value other than \"1\"");
+  eq(helpers.perfOnFor("0", null), false, "perf off: ?perf=0 does not enable");
+  eq(helpers.perfOnFor("", null), false, "perf off: empty param does not enable");
+  eq(helpers.perfOnFor("0", "1"), true, "perf on: a non-\"1\" param does not clear the latch");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

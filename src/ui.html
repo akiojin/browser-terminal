@@ -1021,6 +1021,16 @@ function errorBarAfterEvent(current, event) {
   if (event.type === "error") return formatSessionError(event.message);
   return cur;
 }
+function perfOnFor(paramVal, storedVal) {
+  // Whether perf instrumentation is on for this page load. The URL
+  // parameter (?perf=1) is the entry point; once seen, the caller
+  // latches it into sessionStorage (bt_perf, per-tab like bt_token),
+  // because the token gate's GET form lands on /?token=... and drops
+  // the rest of the query — without the latch, measurement would
+  // silently stop at the gate. A non-"1" parameter never turns it on
+  // by itself and does not clear a latched flag.
+  return paramVal === "1" || storedVal === "1";
+}
 function perfFrameBucket(ms) {
   // Histogram bucket for a requestAnimationFrame interval:
   // <=16.7 / <=33 / <=50 / <=100 / >100 (indices 0..4).
@@ -1139,15 +1149,29 @@ if (params.get("token")) {
 let sessionId = params.get("session") || null;
 
 // --- perf instrumentation (only with ?perf=1) -------------------------------
-// Off unless the URL carries perf=1: no observers, no timers, no posts,
-// and the render/feed hooks below stay null-checked no-ops, so normal
-// use is unchanged. When on, the client aggregates rAF frame intervals,
-// long tasks, render cost (including the target/rebuilt row counts the
-// hotspot hypotheses H1/H2 key on) and feed volume, posts a snapshot to
-// /perf every 5s — the server appends it to perf.log — and flushes the
-// final window via sendBeacon on pagehide. This is how a real-machine
-// scroll session gets measured without DevTools or script injection.
-const PERF_ON = params.get("perf") === "1";
+// Off unless the URL carries perf=1 (or the tab latched it, see below):
+// no observers, no timers, no posts, and the render/feed hooks below
+// stay null-checked no-ops, so normal use is unchanged. When on, the
+// client aggregates rAF frame intervals, long tasks, render cost
+// (including the target/rebuilt row counts the hotspot hypotheses
+// H1/H2 key on) and feed volume, posts a snapshot to /perf every 5s —
+// the server appends it to perf.log — and flushes the final window
+// via sendBeacon on pagehide. This is how a real-machine scroll
+// session gets measured without DevTools or script injection.
+//
+// The flag is latched per-tab in sessionStorage: opening /?perf=1
+// lands on the token gate first, and submitting that form navigates
+// to /?token=... without the perf parameter (the gate form carries
+// perf as a hidden field, and this latch covers any other hop that
+// drops the query), so the load that finally renders the terminal
+// would otherwise see no perf=1 and never start measuring.
+const PERF_PARAM = params.get("perf");
+if (PERF_PARAM === "1") {
+  try { sessionStorage.setItem("bt_perf", "1"); } catch (e) { /* storage unavailable: URL alone still works */ }
+}
+let perfStored = null;
+try { perfStored = sessionStorage.getItem("bt_perf"); } catch (e) { /* storage unavailable */ }
+const PERF_ON = perfOnFor(PERF_PARAM, perfStored);
 let perfAgg = null;
 let perfLongtaskSupported = false;
 let perfVisChanges = 0;
