@@ -6,6 +6,14 @@
  *                scrollback as one binary frame, then live PTY output
  *                as binary frames.
  *   cli -> srv : JSON {type:'input', data} / {type:'resize', rows, cols}
+ * Two pieces of gwt's plumbing are reproduced here (see
+ * bt-xterm-evaluation.md "gwt との差分"):
+ *   - output batching: WS chunks are coalesced per animation frame
+ *     (64K/write, catch-up drain over a 256K backlog) before term.write,
+ *     so the app never paints a half-arrived repaint frame;
+ *   - wheel pacing: while the app reports the mouse, wheel deltas are
+ *     accumulated in pixels and forwarded as capped SGR reports with a
+ *     drain timer, like bt's src/ui.html (a23def2 / 095fc93).
  * Test hooks live on window.__spike. */
 const params = new URLSearchParams(location.search);
 const token = params.get("token") || "";
@@ -44,6 +52,90 @@ if (params.get("renderer") === "webgl" && window.WebglAddon) {
   } catch (e) { webglAddon = null; }
 }
 
+// --- output batching (gwt-style coalescing) ---------------------------------
+// The server sends PTY output as many small WS chunks. Writing each one
+// straight to term.write lets xterm paint half-finished app frames —
+// Codex repaints its whole viewport per wheel step (~5.5KB split across
+// chunks), and the un-coalesced spike visibly smeared rows mid-scroll.
+// gwt coalesces instead (terminal-output-buffer.js): queue the bytes,
+// flush on rAF with a per-write cap, and when the backlog is large,
+// repeat inside a time budget until caught up (catch-up drain, #7553).
+// The connect-time scrollback replay takes the same path, so byte order
+// is preserved end to end.
+const OUT_WRITE_CAP = 64 * 1024;    // bytes per term.write (gwt: 64K chars)
+const OUT_CATCHUP_MIN = 256 * 1024; // backlog that arms the catch-up drain
+const OUT_BUDGET_MS = 8;            // time budget per flush tick
+const utf8 = new TextEncoder();
+let outQueue = [];                  // Uint8Array chunks, in receive order
+let outQueuedBytes = 0;
+let outFlushScheduled = false;
+const outStats = { flushes: 0, writes: 0, bytes: 0, maxWrite: 0 };
+
+function queueOutput(chunk) {
+  const bytes = typeof chunk === "string" ? utf8.encode(chunk) : chunk;
+  if (!bytes.length) return;
+  scanForSgrMode(bytes);
+  outQueue.push(bytes);
+  outQueuedBytes += bytes.length;
+  scheduleOutFlush();
+}
+function scheduleOutFlush() {
+  if (outFlushScheduled) return;
+  outFlushScheduled = true;
+  requestAnimationFrame(flushOutput);
+  // rAF never fires in a hidden document; gwt falls back to a 100ms
+  // timer / MessageChannel there. A plain timer is enough for the spike.
+  setTimeout(() => { if (outFlushScheduled) flushOutput(); }, 100);
+}
+function writeFromQueue(maxBytes) {
+  let total = 0;
+  const parts = [];
+  while (outQueue.length && total < maxBytes) {
+    const head = outQueue[0];
+    if (total + head.length <= maxBytes) { parts.push(outQueue.shift()); total += head.length; }
+    else {
+      const take = maxBytes - total;
+      parts.push(head.subarray(0, take));
+      outQueue[0] = head.subarray(take);
+      total += take;
+    }
+  }
+  if (!parts.length) return 0;
+  outQueuedBytes -= total;
+  let merged = parts[0];
+  if (parts.length > 1) {
+    merged = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) { merged.set(p, off); off += p.length; }
+  }
+  term.write(merged);
+  outStats.writes++;
+  outStats.bytes += total;
+  if (total > outStats.maxWrite) outStats.maxWrite = total;
+  return total;
+}
+function flushOutput() {
+  outFlushScheduled = false;
+  if (!outQueue.length) return;
+  outStats.flushes++;
+  const start = performance.now();
+  // Base case: one capped write per tick. Catch-up drain: while the
+  // backlog stays at/above the threshold, keep writing inside the
+  // budget so a big replay or burst catches up within a few frames.
+  do {
+    writeFromQueue(OUT_WRITE_CAP);
+    if (outQueuedBytes < OUT_CATCHUP_MIN) break;
+  } while (performance.now() - start < OUT_BUDGET_MS);
+  if (outQueuedBytes > 0) scheduleOutFlush();
+}
+function resetOutputQueue() {
+  // A (re)attach replays the full scrollback after term.reset(); bytes
+  // still queued belong to the previous screen and must not land after
+  // the reset.
+  outQueue = [];
+  outQueuedBytes = 0;
+}
+
 // --- protocol ---------------------------------------------------------------
 let ws = null;
 let sessionId = params.get("session") || null;
@@ -52,9 +144,11 @@ let sameIdTried = false;
 let deadSession = false;
 let fallbackCount = 0;
 const sentLog = []; // every payload term.onData produced (tests read this)
+const wsLog = [];   // every payload actually sent over the WS (tests read this)
 
 function sendInput(data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
+    wsLog.push(data);
     ws.send(JSON.stringify({ type: "input", data }));
     return true;
   }
@@ -117,6 +211,7 @@ function connect() {
   sock.onclose = () => {
     if (ws !== sock) return;
     ws = null;
+    resetOutputQueue(); // the reconnect replays scrollback from scratch
     setStatus("disconnected");
     planReconnect();
   };
@@ -131,7 +226,11 @@ function connect() {
         sessionLabel.textContent = msg.name + " (" + msg.id + ")" + (msg.alive ? "" : " exited");
         setStatus("connected — " + msg.name);
         // Fresh attach: the server replays scrollback right after this
-        // message, so reset first to restore the screen exactly.
+        // message, so reset first to restore the screen exactly. Drop
+        // any output still queued from the previous screen, and forget
+        // terminal modes the old stream had set.
+        resetOutputQueue();
+        resetWheelState();
         term.reset();
         return;
       }
@@ -141,14 +240,146 @@ function connect() {
         return;
       }
       if (msg) return; // cwd etc.: not needed for the spike
-      term.write(ev.data);
+      queueOutput(ev.data);
     } else {
-      term.write(new Uint8Array(ev.data));
+      queueOutput(new Uint8Array(ev.data));
     }
   };
 }
 term.onData((data) => { sentLog.push(data); sendInput(data); });
 term.onResize(({ cols, rows }) => sendResize(cols, rows));
+
+// --- wheel pacing (mirrors bt src/ui.html: a23def2 / 095fc93) ---------------
+// A mouse-reporting app repaints its whole viewport per wheel step, so
+// forwarding is paced exactly like bt's: deltas accumulate in pixels, a
+// gesture's first step goes out immediately (planWheelSend borrows the
+// line), each event sends at most WHEEL_EVENT_CAP steps, and the capped
+// backlog drains on a 10ms timer at WHEEL_DRAIN_CAP steps per tick.
+// xterm's own wheel handling is left alone whenever the app is not
+// reporting the mouse (handler returns true -> local scrollback scroll).
+const WHEEL_GESTURE_IDLE_MS = 120; // gap that marks the start of a gesture
+const WHEEL_EVENT_CAP = 3;         // steps per wheel event
+const WHEEL_DRAIN_MS = 10;         // backlog drain interval
+const WHEEL_DRAIN_CAP = 2;         // steps per drain tick
+let wheelAcc = 0;                  // sub-line pixel delta awaiting forwarding
+let lastWheelAt = -Infinity;
+let wheelDrainTimer = null;
+let wheelCol = 1, wheelRow = 1;    // pointer cell of the last wheel event
+let sgrMouse = false;              // DECSET 1006, tracked by scanning output
+
+function planWheelSend(accPx, lineH, maxSteps, gestureStart) {
+  // Same contract as bt's: whole-line steps only, a fresh gesture may
+  // borrow its first line (restPx goes negative) so the total distance
+  // over the gesture still matches the pixel delta, and the per-call
+  // cap keeps one event from queueing an unbounded repaint burst.
+  let steps = Math.trunc(accPx / lineH);
+  if (steps === 0 && gestureStart && Math.abs(accPx) >= 2) steps = accPx > 0 ? 1 : -1;
+  if (steps > maxSteps) steps = maxSteps; else if (steps < -maxSteps) steps = -maxSteps;
+  return { steps, restPx: accPx - steps * lineH };
+}
+function cellDims() {
+  // Cell metrics from xterm's render service (same source the buffer
+  // screenshot code below uses); fall back to element size / grid.
+  const dims = term._core && term._core._renderService && term._core._renderService.dimensions;
+  if (dims && dims.css && dims.css.cell && dims.css.cell.width > 0)
+    return { w: dims.css.cell.width, h: dims.css.cell.height };
+  const el = term.element;
+  if (el && term.cols > 0 && term.rows > 0) {
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) return { w: r.width / term.cols, h: r.height / term.rows };
+  }
+  return null;
+}
+function sendWheelSteps(steps) {
+  const btn = steps > 0 ? 65 : 64; // 64 = wheel up, 65 = wheel down
+  let seq = "";
+  for (let i = 0, n = Math.abs(steps); i < n; i++) {
+    seq += sgrMouse
+      ? "\x1b[<" + btn + ";" + wheelCol + ";" + wheelRow + "M"
+      // X10 encoding packs coords in single bytes (max 223); clamp,
+      // unlike bt, whose fromCharCode wraps past 255.
+      : "\x1b[M" + String.fromCharCode(btn + 32, Math.min(wheelCol, 223) + 32, Math.min(wheelRow, 223) + 32);
+  }
+  if (seq) sendInput(seq);
+}
+function scheduleWheelDrain() {
+  const dims = cellDims();
+  if (wheelDrainTimer !== null || !dims || Math.abs(wheelAcc) < dims.h) return;
+  wheelDrainTimer = setTimeout(() => {
+    wheelDrainTimer = null;
+    if (term.modes.mouseTrackingMode === "none") { wheelAcc = 0; return; }
+    const d = cellDims();
+    if (!d) { wheelAcc = 0; return; }
+    const plan = planWheelSend(wheelAcc, d.h, WHEEL_DRAIN_CAP, false);
+    wheelAcc = plan.restPx;
+    if (plan.steps !== 0) sendWheelSteps(plan.steps);
+    scheduleWheelDrain();
+  }, WHEEL_DRAIN_MS);
+}
+// Track DECSET/DECRST 1006 (SGR mouse encoding) by scanning the output
+// stream itself. A parser.registerCsiHandler hook cannot do this: the
+// built-in DECSET handler is registered first and consumes the sequence
+// before later handlers run (verified empirically — the hook never
+// fired). The scanner is a tiny state machine over CSI bytes only; it
+// carries its state across chunks, so split sequences are fine.
+let csiScan = null; // { priv: bool, params: string } while inside a CSI
+function scanForSgrMode(bytes) {
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (!csiScan) {
+      if (b === 0x1b) csiScan = { esc: true };
+      continue;
+    }
+    if (csiScan.esc) {
+      if (b === 0x5b) { csiScan = { priv: false, params: "" }; } // '['
+      else csiScan = null;
+      continue;
+    }
+    if (b >= 0x40 && b <= 0x7e) { // CSI final byte
+      if ((b === 0x68 || b === 0x6c) && csiScan.priv) { // 'h' / 'l'
+        for (const p of csiScan.params.split(";")) {
+          if (p === "1006") sgrMouse = b === 0x68;
+        }
+      }
+      csiScan = null;
+    } else if (b === 0x3f && csiScan.params === "") { // '?' prefix
+      csiScan.priv = true;
+    } else if ((b >= 0x30 && b <= 0x39) || b === 0x3b) { // digits / ';'
+      csiScan.params += String.fromCharCode(b);
+      if (csiScan.params.length > 32) csiScan = null; // not a mode set
+    } else {
+      csiScan = null; // intermediates etc.: not a plain DECSET
+    }
+  }
+}
+function resetWheelState() {
+  wheelAcc = 0;
+  lastWheelAt = -Infinity;
+  sgrMouse = false;
+  csiScan = null;
+  if (wheelDrainTimer !== null) { clearTimeout(wheelDrainTimer); wheelDrainTimer = null; }
+}
+term.attachCustomWheelEventHandler((e) => {
+  if (e.shiftKey) return true; // keep xterm's shift+wheel behaviour
+  if (term.modes.mouseTrackingMode === "none") return true; // local scroll
+  const dims = cellDims();
+  if (!dims || !term.element) return true;
+  const lineH = dims.h;
+  const now = performance.now();
+  const gestureStart = now - lastWheelAt > WHEEL_GESTURE_IDLE_MS;
+  lastWheelAt = now;
+  wheelAcc += e.deltaMode === 1 ? e.deltaY * lineH
+            : e.deltaMode === 2 ? e.deltaY * lineH * term.rows
+            : e.deltaY;
+  const rect = term.element.getBoundingClientRect();
+  wheelCol = Math.max(1, Math.min(term.cols, Math.floor((e.clientX - rect.left) / dims.w) + 1));
+  wheelRow = Math.max(1, Math.min(term.rows, Math.floor((e.clientY - rect.top) / dims.h) + 1));
+  const plan = planWheelSend(wheelAcc, lineH, WHEEL_EVENT_CAP, gestureStart);
+  wheelAcc = plan.restPx;
+  if (plan.steps !== 0) sendWheelSteps(plan.steps);
+  scheduleWheelDrain();
+  return false; // handled here; xterm must not forward or scroll itself
+});
 let resizeTimer = null;
 window.addEventListener("resize", () => {
   clearTimeout(resizeTimer);
@@ -256,7 +487,20 @@ window.__spike = {
   get rendererActive() { return webglAddon ? "webgl" : "dom"; },
   state: { status: "init" },
   sentLog,
+  wsLog,
   sendInput,
+  queueOutput,
+  flushOutput,
+  outState() {
+    return { queuedBytes: outQueuedBytes, chunks: outQueue.length,
+             flushes: outStats.flushes, writes: outStats.writes,
+             bytes: outStats.bytes, maxWrite: outStats.maxWrite };
+  },
+  wheelState() {
+    return { acc: wheelAcc, sgrMouse, col: wheelCol, row: wheelRow,
+             drainPending: wheelDrainTimer !== null,
+             mouseTrackingMode: term.modes.mouseTrackingMode };
+  },
   connect,
   disconnect() { if (ws) { const s = ws; ws = null; s.onclose = null; try { s.close(); } catch (e) {} } },
   get sessionId() { return sessionId; },
