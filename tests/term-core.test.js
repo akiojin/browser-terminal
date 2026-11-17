@@ -481,5 +481,49 @@ function splitAfter(s, marker) { // [through marker, rest]
   eq(helpers.reconnectDelayMs(-1), 500, "recovery: negative attempt clamps to the start");
 }
 
+// 28. Synchronized update (?2026): TermCore tracks the open/close state so
+// the UI can hold painting until the frame is final.
+{
+  const t = new TermCore(80, 24);
+  eq(t.syncUpdate, false, "?2026: initially off");
+  t.feed("\x1b[?2026h");
+  eq(t.syncUpdate, true, "?2026: h opens a synchronized update");
+  t.feed("abc");
+  eq(t.syncUpdate, true, "?2026: still open while content lands");
+  eq(t.lineText(0), "abc", "?2026: content is applied to the grid while open");
+  t.feed("\x1b[?2026l");
+  eq(t.syncUpdate, false, "?2026: l closes the update");
+  // Split across feeds: the CSI itself may straddle a chunk boundary.
+  const t2 = new TermCore(80, 24);
+  t2.feed("\x1b[?202");
+  eq(t2.syncUpdate, false, "?2026: partial CSI does not open early");
+  t2.feed("6h");
+  eq(t2.syncUpdate, true, "?2026: split CSI still opens");
+  // Combined with other private modes in one sequence.
+  const t3 = new TermCore(80, 24);
+  t3.feed("\x1b[?2026;1006h");
+  eq(t3.syncUpdate, true, "?2026: combined params open the update");
+  ok(t3.mouseModes.has(1006), "?2026: combined params keep other modes");
+  t3.feed("\x1b[?2026l");
+  eq(t3.syncUpdate, false, "?2026: close after combined open");
+  // Reset (session re-attach) must not leave a stale open state behind.
+  t3.feed("\x1b[?2026h");
+  t3.resetAll();
+  eq(t3.syncUpdate, false, "?2026: resetAll clears the open state");
+}
+
+// 29. UI helpers: the ?2026 paint decision — hold while a block is open,
+// arm the fallback timer only once, render as soon as no block is open.
+{
+  const hBegin = html.indexOf("/* === UI-HELPERS-BEGIN === */");
+  const hEnd = html.indexOf("/* === UI-HELPERS-END === */");
+  const helpers = new Function(html.slice(hBegin, hEnd) +
+    "\nreturn { syncHoldAction };")();
+  eq(helpers.syncHoldAction(false, false), "render", "syncHold: no block -> render");
+  eq(helpers.syncHoldAction(false, true), "render", "syncHold: block closed with timer pending -> render");
+  eq(helpers.syncHoldAction(true, false), "hold", "syncHold: block open, no timer -> hold (arm fallback)");
+  eq(helpers.syncHoldAction(true, true), "wait", "syncHold: block open, timer armed -> wait");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

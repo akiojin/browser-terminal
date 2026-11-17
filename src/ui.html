@@ -207,6 +207,7 @@ class TermCore {
     this.appCursor = false;      // DECCKM (?1)
     this.cursorVisible = true;   // ?25
     this.bracketedPaste = false; // ?2004
+    this.syncUpdate = false;     // ?2026 synchronized update in progress
     this.mouseModes = new Set(); // ?1000/1002/1003 tracking, ?1006 SGR encoding
     this.g0 = "B"; this.g1 = "B"; this.gl = 0;
     this.state = "ground"; this.escBuf = ""; this.csiPrefix = "";
@@ -600,6 +601,7 @@ class TermCore {
             else if (n === 1048) { if (set) this.altSaved = this.saveCursor(); else this.restoreCursor(this.altSaved); }
             else if (n === 1049) this.setAltScreen(set, true);
             else if (n === 2004) this.bracketedPaste = set;
+            else if (n === 2026) this.syncUpdate = set;
             else if (n === 1000 || n === 1002 || n === 1003 || n === 1006) {
               if (set) this.mouseModes.add(n); else this.mouseModes.delete(n);
             }
@@ -749,6 +751,16 @@ function reconnectDelayMs(attempt) {
   const n = Math.max(0, attempt | 0);
   return Math.min(8000, 500 * Math.pow(2, n));
 }
+function syncHoldAction(syncActive, timerPending) {
+  // What the feed path does after output reaches TermCore. While a ?2026
+  // synchronized update is open, the frame is not final — painting it
+  // would show a half-drawn screen (the tearing seen with Codex) — so the
+  // paint waits for the block to close: "hold" arms the fallback timer
+  // (a lost close must not freeze the screen), "wait" keeps an armed one.
+  // With no block open, paint right away ("render").
+  if (!syncActive) return "render";
+  return timerPending ? "wait" : "hold";
+}
 function errorBarAfterEvent(current, event) {
   // The error bar's next text. A server "error" event replaces the text;
   // a successful "session" event clears it; anything else (socket open /
@@ -849,6 +861,55 @@ function paintRowBackground(rowEl, rowArr, cursorX) {
   }
   flush(term.cols);
 }
+function rowSignature(rowArr, cursorX) {
+  // Content address of one painted row: everything paintRow() can turn
+  // into DOM — each visible cell's position, text, style and effective
+  // background, plus which cell carries the cursor. Two rows with the
+  // same signature paint to identical DOM, so render() can reuse the
+  // existing element instead of rebuilding it. Fields are separated by
+  // \x01/\x02, which can occur neither in cell text (printables only)
+  // nor in style values (numbers, hex, rgb(...)).
+  let sig = cursorX + "\x01";
+  for (let x = 0; x < term.cols; x++) {
+    const cell = rowArr[x];
+    if (!cell || cell.w === 0) continue;
+    const bg = x === cursorX ? TERM_BG : cellPaint(cell).bg;
+    sig += x + "\x01" + cell.t + "\x01" + styleKeyOf(cell.s) + "\x01" + (bg === TERM_BG ? "" : bg) + "\x02";
+  }
+  return sig;
+}
+function paintRow(rowEl, rowArr, cursorX) {
+  const isCurRow = cursorX >= 0;
+  rowEl.textContent = "";
+  paintRowBackground(rowEl, rowArr, cursorX);
+  let span = null, spanKey = null;
+  const flushText = (cell, isCur) => {
+    const key = isCur ? " CUR" : styleKeyOf(cell.s);
+    if (!span || key !== spanKey) {
+      span = document.createElement("span");
+      if (isCur) span.className = "cur";
+      else { const css = spanCss(cell.s); if (css) span.style.cssText = css; }
+      span.textContent = "";
+      rowEl.appendChild(span);
+      spanKey = key;
+    }
+    span.textContent += cell.t;
+  };
+  for (let x = 0; x < term.cols; x++) {
+    const cell = rowArr[x];
+    if (!cell || cell.w === 0) continue;
+    flushText(cell, isCurRow && x === cursorX);
+  }
+  if (isCurRow) { // cursor past the last written cell / on a continuation cell
+    const cc = rowArr[cursorX];
+    if (!cc || cc.w === 0 || !rowEl.querySelector(".cur")) {
+      const s = document.createElement("span");
+      s.className = "cur"; s.textContent = cc && cc.w !== 0 ? cc.t : " ";
+      rowEl.appendChild(s);
+    }
+  }
+  if (rowEl.childElementCount === 0) rowEl.textContent = " ";
+}
 function render() {
   renderQueued = false;
   // Keep the viewed window stable while new lines land in scrollback.
@@ -862,39 +923,46 @@ function render() {
     const d = document.createElement("div"); d.className = "trow"; termEl.appendChild(d);
   }
   const showCursor = viewOffset === 0 && term.cursorVisible;
+  // Reuse row elements by content: a row whose signature matches what an
+  // existing element already shows keeps its DOM untouched (no rebuild,
+  // no invalidation), and an element whose content merely moved — the
+  // common case when the grid scrolls — is repositioned, not repainted.
+  // Only rows with new content go through paintRow().
+  const reusable = new Map(); // signature -> elements currently showing it
+  for (const el of termEl.children) {
+    if (el._rowSig === undefined) continue;
+    const bucket = reusable.get(el._rowSig);
+    if (bucket) bucket.push(el); else reusable.set(el._rowSig, [el]);
+  }
+  const rowEls = new Array(term.rows);
+  const claimed = new Set();
+  const pending = []; // rows that need a repaint: [y, rowArr, cursorX, sig]
   for (let y = 0; y < term.rows; y++) {
-    const rowEl = termEl.children[y];
     const rowArr = combinedRow(base + y);
-    const isCurRow = showCursor && y === term.cy;
-    rowEl.textContent = "";
-    paintRowBackground(rowEl, rowArr, isCurRow ? term.cx : -1);
-    let span = null, spanKey = null;
-    const flushText = (cell, isCur) => {
-      const key = isCur ? " CUR" : styleKeyOf(cell.s);
-      if (!span || key !== spanKey) {
-        span = document.createElement("span");
-        if (isCur) span.className = "cur";
-        else { const css = spanCss(cell.s); if (css) span.style.cssText = css; }
-        span.textContent = "";
-        rowEl.appendChild(span);
-        spanKey = key;
-      }
-      span.textContent += cell.t;
-    };
-    for (let x = 0; x < term.cols; x++) {
-      const cell = rowArr[x];
-      if (!cell || cell.w === 0) continue;
-      flushText(cell, isCurRow && x === term.cx);
+    const cursorX = showCursor && y === term.cy ? term.cx : -1;
+    const sig = rowSignature(rowArr, cursorX);
+    const bucket = reusable.get(sig);
+    if (bucket && bucket.length) {
+      const el = bucket.shift();
+      claimed.add(el);
+      rowEls[y] = el;
+    } else {
+      pending.push([y, rowArr, cursorX, sig]);
     }
-    if (isCurRow) { // cursor past the last written cell / on a continuation cell
-      const cc = rowArr[term.cx];
-      if (!cc || cc.w === 0 || !rowEl.querySelector(".cur")) {
-        const s = document.createElement("span");
-        s.className = "cur"; s.textContent = cc && cc.w !== 0 ? cc.t : " ";
-        rowEl.appendChild(s);
-      }
+  }
+  if (pending.length) {
+    const spares = [];
+    for (const el of termEl.children) if (!claimed.has(el)) spares.push(el);
+    for (const [y, rowArr, cursorX, sig] of pending) {
+      let el = spares.length ? spares.shift() : null;
+      if (!el) { el = document.createElement("div"); el.className = "trow"; }
+      paintRow(el, rowArr, cursorX);
+      el._rowSig = sig;
+      rowEls[y] = el;
     }
-    if (rowEl.childElementCount === 0) rowEl.textContent = " ";
+  }
+  for (let y = 0; y < term.rows; y++) {
+    if (termEl.children[y] !== rowEls[y]) termEl.insertBefore(rowEls[y], termEl.children[y] || null);
   }
   // Scrollbar thumb + IME textarea placement.
   const total = term.scrollback.length + term.rows;
@@ -918,6 +986,22 @@ function render() {
 }
 function requestRender() {
   if (!renderQueued) { renderQueued = true; requestAnimationFrame(render); }
+}
+// While a ?2026 synchronized update is open, the frame TermCore holds is
+// not final: painting it would show the half-drawn state (tearing). Hold
+// the paint until the block closes; if the close never arrives (lost or
+// unterminated block), the fallback timer paints what we have after
+// SYNC_HOLD_MS so the screen cannot freeze mid-block.
+const SYNC_HOLD_MS = 100;
+let syncHoldTimer = null;
+function afterTermFeed() {
+  const action = syncHoldAction(term.syncUpdate, syncHoldTimer !== null);
+  if (action === "render") {
+    if (syncHoldTimer) { clearTimeout(syncHoldTimer); syncHoldTimer = null; }
+    requestRender();
+  } else if (action === "hold") {
+    syncHoldTimer = setTimeout(() => { syncHoldTimer = null; requestRender(); }, SYNC_HOLD_MS);
+  }
 }
 term.onResponse = (s) => sendInput(s);
 
@@ -1062,10 +1146,10 @@ function connect() {
         return;
       } catch (e) { /* not JSON: render as terminal output */ }
       term.feed(ev.data);
-      requestRender();
+      afterTermFeed();
     } else {
       term.feed(decoder.decode(new Uint8Array(ev.data), { stream: true }));
-      requestRender();
+      afterTermFeed();
     }
   };
 }
