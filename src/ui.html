@@ -207,6 +207,7 @@ class TermCore {
     this.appCursor = false;      // DECCKM (?1)
     this.cursorVisible = true;   // ?25
     this.bracketedPaste = false; // ?2004
+    this.mouseModes = new Set(); // ?1000/1002/1003 tracking, ?1006 SGR encoding
     this.g0 = "B"; this.g1 = "B"; this.gl = 0;
     this.state = "ground"; this.escBuf = ""; this.csiPrefix = "";
     this.lastCell = null;        // for combining chars / REP
@@ -549,7 +550,9 @@ class TermCore {
             else if (n === 1048) { if (set) this.altSaved = this.saveCursor(); else this.restoreCursor(this.altSaved); }
             else if (n === 1049) this.setAltScreen(set, true);
             else if (n === 2004) this.bracketedPaste = set;
-            // mouse modes (1000/1002/1003/1006...) intentionally not tracked
+            else if (n === 1000 || n === 1002 || n === 1003 || n === 1006) {
+              if (set) this.mouseModes.add(n); else this.mouseModes.delete(n);
+            }
           }
         } else {
           for (const n of nums) if (n === 4) this.insertMode = set;
@@ -1092,10 +1095,28 @@ document.addEventListener("copy", () => {
 termwrap.addEventListener("wheel", (e) => {
   e.preventDefault();
   const lines = e.deltaMode === 1 ? Math.round(e.deltaY) : Math.round(e.deltaY / lineH);
-  if (lines !== 0) {
-    viewOffset = Math.max(0, Math.min(term.scrollback.length, viewOffset - lines));
-    requestRender();
+  if (lines === 0) return;
+  // When the app has mouse reporting on (full-screen TUIs such as Codex),
+  // the alt screen accumulates no local scrollback, so local scrolling is a
+  // no-op. Forward the wheel to the app instead, like other terminals do.
+  // Clicks/selection stay local to preserve bt's copy behaviour.
+  if (!e.shiftKey && term.mouseModes.size > 0) {
+    const rect = termwrap.getBoundingClientRect();
+    const col = Math.max(1, Math.min(term.cols, Math.floor((e.clientX - rect.left) / charW) + 1));
+    const row = Math.max(1, Math.min(term.rows, Math.floor((e.clientY - rect.top) / lineH) + 1));
+    const btn = lines > 0 ? 65 : 64; // 64 = wheel up, 65 = wheel down
+    const n = Math.min(5, Math.abs(lines));
+    let seq = "";
+    for (let i = 0; i < n; i++) {
+      seq += term.mouseModes.has(1006)
+        ? "\x1b[<" + btn + ";" + col + ";" + row + "M"
+        : "\x1b[M" + String.fromCharCode(btn + 32, col + 32, row + 32);
+    }
+    if (seq) sendInput(seq);
+    return;
   }
+  viewOffset = Math.max(0, Math.min(term.scrollback.length, viewOffset - lines));
+  requestRender();
 }, { passive: false });
 
 // --- Session list -------------------------------------------------------------

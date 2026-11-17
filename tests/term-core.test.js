@@ -95,6 +95,19 @@ function ok(cond, name) { eq(!!cond, true, name); }
   eq(t.lineText(0), "main", "leaving alt screen restores main");
 }
 
+// 7b. Mouse modes: tracking + SGR flags follow DECSET/DECRST
+{
+  const t = new TermCore(20, 4);
+  eq(t.mouseModes.size, 0, "mouse modes start empty");
+  t.feed("\x1b[?1002h\x1b[?1006h");
+  eq(t.mouseModes.has(1002) && t.mouseModes.has(1006), true, "mouse modes tracked on DECSET");
+  t.feed("\x1b[?1006l");
+  eq(t.mouseModes.has(1006), false, "SGR flag clears on DECRST");
+  eq(t.mouseModes.has(1002), true, "tracking mode survives SGR clear");
+  t.feed("\x1b[?1002l");
+  eq(t.mouseModes.size, 0, "all mouse modes clear");
+}
+
 // 8. Insert / delete chars, insert lines
 {
   const t = new TermCore(20, 4);
