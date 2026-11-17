@@ -11,6 +11,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
+const WebSocket = require("ws");
 
 const { parseOsc7Payload, createOsc7Tracker, readProcCwd, parseLsofCwd } = require("../src/cwd");
 const { idleTimeoutMs, isIdle, sweepIntervalMs } = require("../src/idle");
@@ -245,6 +246,44 @@ async function integration() {
     const created = await createRes.json();
     ok(!!created.id, "integration: session created");
     eq(created.cwd, os.homedir(), "integration: session starts in home dir");
+
+    // WS attach to a nonexistent session id: the error must carry the
+    // machine-readable code the client's recovery path keys on.
+    const bogus = await new Promise((resolve) => {
+      const out = { error: null, closed: false };
+      const sock = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${token}&session=deadbeef`);
+      sock.on("message", (d, isBinary) => {
+        if (isBinary) return;
+        try { const m = JSON.parse(d.toString()); if (m.type === "error") out.error = m; } catch (_) {}
+      });
+      sock.on("close", () => { out.closed = true; resolve(out); });
+      sock.on("error", () => {});
+      setTimeout(() => { try { sock.close(); } catch (_) {} resolve(out); }, 3000);
+    });
+    ok(bogus.error && bogus.error.code === "no_such_session",
+       "integration: bogus session id returns code no_such_session");
+    ok(bogus.closed, "integration: bogus session socket is closed by the server");
+
+    // Destroying a session must close its attached sockets, so the tab
+    // is not left as a silent zombie (its recovery path takes over).
+    const attached = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${token}&session=new`);
+    const sessMsg = await new Promise((resolve) => {
+      attached.on("message", (d, isBinary) => {
+        if (isBinary) return;
+        try { resolve(JSON.parse(d.toString())); } catch (_) {}
+      });
+      attached.on("error", () => {});
+      setTimeout(() => resolve(null), 3000);
+    });
+    ok(sessMsg && sessMsg.type === "session" && !!sessMsg.id, "integration: ws attach returns a session");
+    const attachedClosed = new Promise((resolve) => {
+      attached.on("close", () => resolve(true));
+      setTimeout(() => resolve(false), 5000);
+    });
+    if (sessMsg && sessMsg.id) {
+      await fetch(`${base}/sessions/${sessMsg.id}?token=${encodeURIComponent(token)}`, { method: "DELETE" });
+    }
+    ok(await attachedClosed, "integration: destroying a session closes its attached socket");
 
     await fetch(`${base}/api/exec`, {
       method: "POST", headers,

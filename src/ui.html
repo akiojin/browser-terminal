@@ -733,6 +733,22 @@ function formatSessionError(message) {
   const m = String(message == null ? "" : message).trim();
   return m ? "Failed to start session: " + m : "Failed to start session";
 }
+function pickRecoverySession(sessions, excludeId) {
+  // Fallback target after the attached session turned out to be gone:
+  // the first live session other than the dead one, or null (the caller
+  // then creates a fresh session). Exited sessions are not picked — a
+  // fresh shell is more useful than a dead one's final frame.
+  if (!Array.isArray(sessions)) return null;
+  for (const s of sessions) {
+    if (s && s.alive && s.id && s.id !== excludeId) return s.id;
+  }
+  return null;
+}
+function reconnectDelayMs(attempt) {
+  // Exponential backoff for automatic reconnects: 0.5s doubling, 8s cap.
+  const n = Math.max(0, attempt | 0);
+  return Math.min(8000, 500 * Math.pow(2, n));
+}
 function errorBarAfterEvent(current, event) {
   // The error bar's next text. A server "error" event replaces the text;
   // a successful "session" event clears it; anything else (socket open /
@@ -947,24 +963,80 @@ function setStatus(text, on) {
   statusEl.textContent = text;
   dot.className = "dot " + (on === true ? "on" : on === false ? "off" : "");
 }
+// --- Reconnect / session recovery -------------------------------------------
+// Sessions live only in the server's memory, so a server restart (or an
+// idle-timeout destroy) makes the id in the URL stale. The recovery path:
+// retry the same id once (a transient network drop keeps the session),
+// then fall back to the session list — reattach to a live session, or
+// create a fresh one when none is alive. A server "no_such_session"
+// error short-circuits straight to the fallback.
+let reconnectTimer = null;
+let reconnectAttempts = 0; // consecutive failures, drives the backoff
+let sameIdTried = false;   // the current id already had its one retry
+let deadSession = false;   // the server said this id is gone
+let fallbackCount = 0;     // consecutive list fallbacks (loop brake)
+function resetRecovery() {
+  reconnectAttempts = 0;
+  sameIdTried = false;
+  deadSession = false;
+  fallbackCount = 0;
+}
+function planReconnect() {
+  if (reconnectTimer) return;
+  if (fallbackCount > 3) return; // exhausted: the Reconnect button retries manually
+  const delay = reconnectDelayMs(reconnectAttempts);
+  reconnectAttempts++;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (deadSession || sameIdTried) fallbackAttach();
+    else { sameIdTried = true; connect(); }
+  }, delay);
+}
+async function fallbackAttach() {
+  fallbackCount++;
+  let list = null;
+  try {
+    const res = await fetch("/sessions?token=" + encodeURIComponent(token));
+    if (res.ok) list = await res.json();
+  } catch (e) { /* server unreachable: keep backing off */ }
+  if (!list) { planReconnect(); return; }
+  deadSession = false;
+  sameIdTried = false;
+  const mine = sessionId && list.find((s) => s && s.id === sessionId && s.alive);
+  if (!mine) sessionId = pickRecoverySession(list, sessionId); // null -> fresh session
+  connect();
+}
 function connect() {
-  if (ws) { try { ws.close(); } catch (e) {} }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) {
+    const old = ws;
+    ws = null;
+    old.onopen = old.onclose = old.onerror = old.onmessage = null;
+    try { old.close(); } catch (e) {}
+  }
   const q = new URLSearchParams({ token });
   q.set("session", sessionId || "new");
-  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?" + q);
-  ws.binaryType = "arraybuffer";
+  const sock = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?" + q);
+  ws = sock;
+  sock.binaryType = "arraybuffer";
   // Fresh decoder per connection: a shared one would leak an unfinished
   // multi-byte sequence from the previous connection into this replay.
   const decoder = new TextDecoder("utf-8");
   setStatus("connecting…", null);
-  ws.onopen = () => { setStatus("connected", true); const m = measure(); sendResize(m.cols, m.rows); requestRender(); ime.focus({ preventScroll: true }); };
-  ws.onclose = () => setStatus("disconnected", false);
-  ws.onerror = () => setStatus("error", false);
-  ws.onmessage = (ev) => {
+  sock.onopen = () => { setStatus("connected", true); const m = measure(); sendResize(m.cols, m.rows); requestRender(); ime.focus({ preventScroll: true }); };
+  sock.onclose = () => {
+    if (ws !== sock) return;
+    ws = null;
+    setStatus("disconnected", false);
+    planReconnect();
+  };
+  sock.onerror = () => { if (ws === sock) setStatus("error", false); };
+  sock.onmessage = (ev) => {
     if (typeof ev.data === "string") {
       try {
         const msg = JSON.parse(ev.data);
         if (msg.type === "session") {
+          resetRecovery();
           sessionId = msg.id;
           setCwd(msg.cwd || "");
           applyErrorBar(errorBarAfterEvent(lastErrorText, msg));
@@ -982,6 +1054,7 @@ function connect() {
         } else if (msg.type === "cwd") {
           setCwd(msg.cwd || "");
         } else if (msg.type === "error") {
+          if (msg.code === "no_such_session" || msg.message === "no such session") deadSession = true;
           applyErrorBar(errorBarAfterEvent(lastErrorText, msg));
           setStatus("error: " + msg.message, false);
         }
@@ -1194,7 +1267,7 @@ async function refreshSessions() {
 setInterval(refreshSessions, 5000);
 document.getElementById("attach").onclick = () => {
   const sel = document.getElementById("sessions");
-  if (sel.value) { sessionId = sel.value; connect(); }
+  if (sel.value) { sessionId = sel.value; resetRecovery(); connect(); }
 };
 document.getElementById("new").onclick = () => {
   window.open("/?token=" + encodeURIComponent(token) + "&session=new", "_blank");
@@ -1329,7 +1402,15 @@ document.getElementById("shot").onclick = (ev) => {
   }, "image/png");
   ime.focus({ preventScroll: true });
 };
-document.getElementById("reconnect").onclick = () => connect();
+document.getElementById("reconnect").onclick = () => {
+  // Same recovery path as the automatic one: a dead id goes through the
+  // list fallback instead of repeating the doomed connect.
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  reconnectAttempts = 0;
+  fallbackCount = 0;
+  if (deadSession) fallbackAttach();
+  else { sameIdTried = false; connect(); }
+};
 document.getElementById("kill").onclick = async () => {
   if (!sessionId) return;
   await fetch("/sessions/" + sessionId + "?token=" + encodeURIComponent(token), { method: "DELETE" });

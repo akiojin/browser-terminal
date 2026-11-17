@@ -451,5 +451,35 @@ function splitAfter(s, marker) { // [through marker, rest]
   eq(t8.lineText(0), "あ いう", "wide: ICH at a continuation cell does not split the char");
 }
 
+// 27. UI helpers: session recovery after the attached session is gone
+// (server restart / idle destroy). The fallback picks a live session
+// other than the dead one, or null -> create a fresh session.
+{
+  const hBegin = html.indexOf("/* === UI-HELPERS-BEGIN === */");
+  const hEnd = html.indexOf("/* === UI-HELPERS-END === */");
+  const helpers = new Function(html.slice(hBegin, hEnd) +
+    "\nreturn { pickRecoverySession, reconnectDelayMs };")();
+  const list = [
+    { id: "dead1", alive: true },
+    { id: "live1", alive: true },
+    { id: "gone1", alive: false },
+    { id: "live2", alive: true },
+  ];
+  eq(helpers.pickRecoverySession(list, "dead1"), "live1", "recovery: first live session other than the dead one");
+  eq(helpers.pickRecoverySession(list, "nosuch"), "dead1", "recovery: unknown exclude id -> first live session");
+  eq(helpers.pickRecoverySession([{ id: "a", alive: false }], "x"), null, "recovery: no live session -> null (create fresh)");
+  eq(helpers.pickRecoverySession([], "x"), null, "recovery: empty list -> null");
+  eq(helpers.pickRecoverySession(null, "x"), null, "recovery: non-array list -> null");
+  eq(helpers.pickRecoverySession(undefined, "x"), null, "recovery: missing list -> null");
+
+  eq(helpers.reconnectDelayMs(0), 500, "recovery: backoff starts at 500ms");
+  eq(helpers.reconnectDelayMs(1), 1000, "recovery: backoff doubles");
+  eq(helpers.reconnectDelayMs(2), 2000, "recovery: backoff doubles again");
+  eq(helpers.reconnectDelayMs(3), 4000, "recovery: backoff keeps doubling");
+  eq(helpers.reconnectDelayMs(4), 8000, "recovery: backoff caps at 8s");
+  eq(helpers.reconnectDelayMs(10), 8000, "recovery: backoff stays capped");
+  eq(helpers.reconnectDelayMs(-1), 500, "recovery: negative attempt clamps to the start");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

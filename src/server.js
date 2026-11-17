@@ -279,6 +279,7 @@ function createSession(name) {
     seq: 0,
     clients: new Set(), // WebSocket binary senders attached to this session
     controlClients: new Set(), // WebSocket JSON control senders (cwd updates)
+    sockets: new Set(), // attached WebSocket objects (closed on destroy)
   };
 
   const cap = CONFIG.scrollback_bytes;
@@ -387,6 +388,17 @@ function destroySession(session, reason) {
     }
     audit(session.name, 'server', `session closed: ${reason}`);
   }
+  // Close attached sockets: a tab left open on a destroyed session would
+  // otherwise sit silent forever (its input dropped by feedInput's guard).
+  // Closing lets the client's reconnect/recovery path take over.
+  for (const sock of Array.from(session.sockets)) {
+    try {
+      sock.close();
+    } catch (_) {
+      /* already gone */
+    }
+  }
+  session.sockets.clear();
   try {
     session.proc.kill();
   } catch (_) {
@@ -617,14 +629,17 @@ function handleWs(ws, req) {
     try {
       session = createSession(nameParam || undefined);
     } catch (e) {
-      ws.send(JSON.stringify({ type: 'error', message: e.message }));
+      ws.send(JSON.stringify({ type: 'error', code: 'session_create_failed', message: e.message }));
       ws.close();
       return;
     }
   } else {
     session = sessions.get(sessionParam);
     if (!session) {
-      ws.send(JSON.stringify({ type: 'error', message: 'no such session' }));
+      // The machine-readable code lets the client drop the dead id and
+      // fall back to a live session (or a fresh one) instead of retrying
+      // the same id forever.
+      ws.send(JSON.stringify({ type: 'error', code: 'no_such_session', message: 'no such session' }));
       ws.close();
       return;
     }
@@ -653,6 +668,7 @@ function handleWs(ws, req) {
     if (ws.readyState === ws.OPEN) ws.send(msg);
   };
   session.controlClients.add(sendControl);
+  session.sockets.add(ws);
 
   const lineState = { buf: '' };
   ws.on('message', (data, isBinary) => {
@@ -697,10 +713,12 @@ function handleWs(ws, req) {
   ws.on('close', () => {
     session.clients.delete(send);
     session.controlClients.delete(sendControl);
+    session.sockets.delete(ws);
   });
   ws.on('error', () => {
     session.clients.delete(send);
     session.controlClients.delete(sendControl);
+    session.sockets.delete(ws);
   });
 }
 
