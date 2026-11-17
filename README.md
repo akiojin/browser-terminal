@@ -172,6 +172,26 @@ cd ~/tools/browser-terminal && npm install
 
 Then restart the server.
 
+#### 7. Run it as a background service (optional)
+
+To start browser-terminal automatically at login, register it as a
+per-user OS service:
+
+```sh
+cd ~/tools/browser-terminal
+npm run service -- install     # write the unit file and load the service
+npm run service -- status      # show whether the unit file is installed
+npm run service -- uninstall   # unload the service and remove the unit
+```
+
+Add `--dry-run` to `install` / `uninstall` to print the unit file and
+the commands without changing anything. On macOS this writes a
+LaunchAgent (`~/Library/LaunchAgents/com.browser-terminal.plist`,
+logs to `~/Library/Logs/browser-terminal.log`); on Linux a systemd user
+unit (`~/.config/systemd/user/browser-terminal.service`, enabled with
+`systemctl --user enable --now`). Windows is not automated — the
+command prints Task Scheduler guidance instead.
+
 ### Troubleshooting
 
 - **`pty spawn self-check FAILED: ... posix_spawnp failed.` in the
@@ -215,7 +235,13 @@ api_enabled = false       # enable the agent API
 # shell = "/bin/zsh"      # optional shell override
 scrollback_bytes = 262144 # raw scrollback kept per session
 # audit_log = "audit.log" # path (relative to the config dir)
+idle_timeout_minutes = 0  # close sessions with no input/output this long; 0 = never
 ```
+
+The UI header shows the attached session's current working directory
+(`cwd: ...`), and the session list endpoints report it as `cwd`. The
+server reads it from the OS (Linux `/proc`, macOS `lsof`) and from
+OSC 7 sequences when the shell emits them.
 
 ## Agent API (when `api_enabled = true`)
 
@@ -245,11 +271,13 @@ Prototype (v0.2, Node.js rewrite). Implemented: PTY sessions with
 per-session state, multi-session + reattach with scrollback replay,
 cell-grid terminal UI (DOM text) with ANSI colors and alternate-screen
 support, direct key input with IME composition and paste, token auth,
-optional agent API, audit log.
+optional agent API, audit log, the attached session's cwd in the UI
+header, an optional session idle timeout (`idle_timeout_minutes`), and
+OS service registration helpers for launchd / systemd
+(`npm run service -- install`).
 
-Not yet (v2 candidates): mouse reporting in the UI, session idle timeout,
-OS service registration helpers (launchd / systemd / Windows service),
-in-UI indicators for cwd / running state / sudo password wait.
+Not yet (v2 candidates): mouse reporting in the UI, in-UI indicators
+for running state / sudo password wait.
 
 ## License
 

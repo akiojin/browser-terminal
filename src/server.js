@@ -14,11 +14,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFileSync, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 const pty = require('node-pty');
 const { parse: parseToml } = require('smol-toml');
 const { repairNodePtySpawnHelpers, probePtySpawn } = require('./spawn-helper');
+const { createOsc7Tracker, readProcCwd, parseLsofCwd } = require('./cwd');
+const { idleTimeoutMs, isIdle, sweepIntervalMs } = require('./idle');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -71,6 +73,8 @@ function loadOrCreateConfig(cfgPath) {
       scrollback_bytes:
         raw.scrollback_bytes !== undefined ? Number(raw.scrollback_bytes) : DEFAULT_SCROLLBACK,
       audit_log: raw.audit_log !== undefined ? String(raw.audit_log) : undefined,
+      idle_timeout_minutes:
+        raw.idle_timeout_minutes !== undefined ? Number(raw.idle_timeout_minutes) : 0,
     };
     if (!cfg.token) throw new Error('config has an empty token');
     return { cfg, dir: path.dirname(cfgPath) };
@@ -85,6 +89,7 @@ function loadOrCreateConfig(cfgPath) {
     shell: undefined,
     scrollback_bytes: DEFAULT_SCROLLBACK,
     audit_log: undefined,
+    idle_timeout_minutes: 0,
   };
   const lines = [
     `port = ${cfg.port}`,
@@ -92,6 +97,7 @@ function loadOrCreateConfig(cfgPath) {
     `bind = "${cfg.bind}"`,
     `api_enabled = ${cfg.api_enabled}`,
     `scrollback_bytes = ${cfg.scrollback_bytes}`,
+    `idle_timeout_minutes = ${cfg.idle_timeout_minutes}`,
     '',
   ];
   fs.writeFileSync(cfgPath, lines.join('\n'), { mode: 0o600 });
@@ -258,15 +264,23 @@ function createSession(name) {
     created_at: nowRfc3339(),
     alive: true,
     proc,
+    cwd: os.homedir(),
+    cwdCheckedAt: 0,
+    lastActivityAt: Date.now(),
+    osc7: createOsc7Tracker(),
     scrollback: Buffer.alloc(0),
     transcript: [], // [{seq, text}]
     transcriptBytes: 0,
     seq: 0,
-    clients: new Set(), // WebSocket senders attached to this session
+    clients: new Set(), // WebSocket binary senders attached to this session
+    controlClients: new Set(), // WebSocket JSON control senders (cwd updates)
   };
 
   const cap = CONFIG.scrollback_bytes;
   proc.onData((data) => {
+    session.lastActivityAt = Date.now();
+    const oscCwd = session.osc7.feed(data);
+    if (oscCwd) setSessionCwd(session, oscCwd);
     const chunk = Buffer.from(data, 'utf8');
     let sb = Buffer.concat([session.scrollback, chunk]);
     if (sb.length > cap) sb = sb.subarray(sb.length - cap);
@@ -310,8 +324,73 @@ function createSession(name) {
   return session;
 }
 
+// Record a new cwd for a session and tell attached UI clients.
+function setSessionCwd(session, cwd) {
+  if (!cwd || cwd === session.cwd) return;
+  session.cwd = cwd;
+  const msg = JSON.stringify({ type: 'cwd', cwd });
+  for (const send of Array.from(session.controlClients)) {
+    try {
+      send(msg);
+    } catch (_) {
+      session.controlClients.delete(send);
+    }
+  }
+}
+
+// The session's current cwd, refreshed from the OS where that is cheap
+// (Linux /proc on demand; macOS lsof at most every 2s, async). OSC 7
+// updates land in session.cwd directly from the output handler.
+function currentCwd(session) {
+  if (!session.alive || !session.proc || !session.proc.pid) return session.cwd;
+  if (process.platform === 'linux') {
+    const cwd = readProcCwd(session.proc.pid);
+    if (cwd) setSessionCwd(session, cwd);
+  } else if (process.platform === 'darwin') {
+    const now = Date.now();
+    if (now - session.cwdCheckedAt > 2000) {
+      session.cwdCheckedAt = now;
+      execFile(
+        'lsof',
+        ['-a', '-p', String(session.proc.pid), '-d', 'cwd', '-Fn'],
+        { timeout: 2000 },
+        (err, stdout) => {
+          if (err) return;
+          const cwd = parseLsofCwd(stdout);
+          if (cwd) setSessionCwd(session, cwd);
+        }
+      );
+    }
+  }
+  return session.cwd;
+}
+
+// Remove a session and kill its shell. With a reason, attached clients
+// see an explanatory note in the terminal before the exit note.
+function destroySession(session, reason) {
+  sessions.delete(session.id);
+  session.alive = false;
+  if (reason) {
+    const note = Buffer.from(`\r\n\x1b[33m[session closed: ${reason}]\x1b[0m\r\n`, 'utf8');
+    session.scrollback = Buffer.concat([session.scrollback, note]);
+    for (const send of Array.from(session.clients)) {
+      try {
+        send(note);
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    audit(session.name, 'server', `session closed: ${reason}`);
+  }
+  try {
+    session.proc.kill();
+  } catch (_) {
+    /* already gone */
+  }
+}
+
 function sessionInfo(s) {
-  return { id: s.id, name: s.name, created_at: s.created_at, alive: s.alive };
+  return { id: s.id, name: s.name, created_at: s.created_at, alive: s.alive, cwd: currentCwd(s) };
 }
 
 function listSessions() {
@@ -416,13 +495,7 @@ async function handleHttp(req, res) {
     const id = decodeURIComponent(killMatch[1]);
     const session = sessions.get(id);
     if (!session) return sendEmpty(res, 404);
-    sessions.delete(id);
-    try {
-      session.proc.kill();
-    } catch (_) {
-      /* already gone */
-    }
-    session.alive = false;
+    destroySession(session);
     return sendJson(res, 200, { ok: true });
   }
 
@@ -450,6 +523,7 @@ async function handleHttp(req, res) {
         name: s.name,
         created_at: s.created_at,
         alive: true,
+        cwd: s.cwd,
       });
     } catch (e) {
       return sendJson(res, 500, { error: e.message });
@@ -468,6 +542,7 @@ async function handleHttp(req, res) {
     const session = sessions.get(body.session);
     if (!session) return sendEmpty(res, 404);
     if (!session.alive) return sendJson(res, 410, { error: 'session has exited' });
+    session.lastActivityAt = Date.now();
     audit(session.name, 'api', body.command || '');
     try {
       session.proc.write(String(body.command || '') + '\r');
@@ -507,6 +582,7 @@ async function handleHttp(req, res) {
 
 // Write input to the PTY and audit-log completed lines.
 function feedInput(session, lineState, data) {
+  session.lastActivityAt = Date.now();
   try {
     session.proc.write(data);
   } catch (_) {
@@ -555,6 +631,7 @@ function handleWs(ws, req) {
       id: session.id,
       name: session.name,
       alive: session.alive,
+      cwd: currentCwd(session),
     })
   );
 
@@ -567,10 +644,15 @@ function handleWs(ws, req) {
     if (ws.readyState === ws.OPEN) ws.send(chunk, { binary: true });
   };
   session.clients.add(send);
+  const sendControl = (msg) => {
+    if (ws.readyState === ws.OPEN) ws.send(msg);
+  };
+  session.controlClients.add(sendControl);
 
   const lineState = { buf: '' };
   ws.on('message', (data, isBinary) => {
     if (isBinary) {
+      session.lastActivityAt = Date.now();
       try {
         session.proc.write(data.toString('utf8'));
       } catch (_) {
@@ -609,9 +691,11 @@ function handleWs(ws, req) {
 
   ws.on('close', () => {
     session.clients.delete(send);
+    session.controlClients.delete(sendControl);
   });
   ws.on('error', () => {
     session.clients.delete(send);
+    session.controlClients.delete(sendControl);
   });
 }
 
@@ -678,6 +762,23 @@ function main() {
       handleWs(ws, req);
     });
   });
+
+  // Idle-timeout sweeper: close sessions with no input or output for
+  // idle_timeout_minutes (0 = disabled, the default).
+  const idleMs = idleTimeoutMs(CONFIG.idle_timeout_minutes);
+  if (idleMs > 0) {
+    console.log(`session idle timeout: ${CONFIG.idle_timeout_minutes} minute(s)`);
+    const sweeper = setInterval(() => {
+      const now = Date.now();
+      for (const s of Array.from(sessions.values())) {
+        if (s.alive && isIdle(s.lastActivityAt, now, idleMs)) {
+          console.log(`closing idle session ${s.name} (${s.id})`);
+          destroySession(s, 'idle timeout');
+        }
+      }
+    }, sweepIntervalMs(idleMs));
+    sweeper.unref();
+  }
 
   server.on('error', (e) => {
     console.error(`failed to bind ${CONFIG.bind}:${CONFIG.port}: ${e.message}`);
