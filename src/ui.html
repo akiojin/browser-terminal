@@ -785,7 +785,7 @@ function render() {
   if (total > term.rows) {
     const wrapH = termwrap.clientHeight;
     sbthumb.style.height = Math.max(20, wrapH * term.rows / total) + "px";
-    sbthumb.style.top = (wrapH * viewOffset / total) + "px";
+    sbthumb.style.top = (wrapH * (term.scrollback.length - viewOffset) / total) + "px";
   }
   const cs = getComputedStyle(termEl);
   ime.style.left = (parseFloat(cs.paddingLeft) + term.cx * charW) + "px";
@@ -1030,7 +1030,7 @@ termwrap.addEventListener("wheel", (e) => {
   e.preventDefault();
   const lines = e.deltaMode === 1 ? Math.round(e.deltaY) : Math.round(e.deltaY / lineH);
   if (lines !== 0) {
-    viewOffset = Math.max(0, Math.min(term.scrollback.length, viewOffset + lines));
+    viewOffset = Math.max(0, Math.min(term.scrollback.length, viewOffset - lines));
     requestRender();
   }
 }, { passive: false });
