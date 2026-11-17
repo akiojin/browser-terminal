@@ -1005,7 +1005,12 @@ function keyToSeq(e) {
     return undefined; // let the browser handle other Ctrl combos (reload, etc.)
   }
   if (e.altKey && k.length === 1) return "\x1b" + k;
-  if (k.length === 1) return k;
+  // Plain printable characters are NOT sent here: the textarea's input event
+  // delivers them. Sending on keydown double-sends the first keystroke of an
+  // IME composition (e.g. typing 日本語 produced "n日本語"), because that
+  // keydown arrives before compositionstart while the IME still claims the
+  // same keystroke for the composition.
+  if (k.length === 1) return null;
   return undefined;
 }
 ime.addEventListener("keydown", (e) => {
