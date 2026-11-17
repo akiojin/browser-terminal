@@ -185,6 +185,7 @@ class TermCore {
   constructor(cols, rows, opts) {
     opts = opts || {};
     this.scrollbackLimit = opts.scrollbackLimit || 5000;
+    this.rowVer = new WeakMap(); // row array -> mutation version (render reuse key)
     this.onResponse = null;      // (string) => void, for DSR/DA replies
     this.cols = Math.max(2, cols | 0);
     this.rows = Math.max(1, rows | 0);
@@ -213,6 +214,7 @@ class TermCore {
     this.g0 = "B"; this.g1 = "B"; this.gl = 0;
     this.state = "ground"; this.escBuf = ""; this.csiPrefix = "";
     this.lastCell = null;        // for combining chars / REP
+    this.lastCellRow = null;     // row array holding lastCell
     this.lastChar = null;
     this.sbAdded = 0;            // lines pushed to scrollback since last read
   }
@@ -227,6 +229,16 @@ class TermCore {
     for (let i = 0; i < this.rows; i++) g[i] = this.blankRow();
     return g;
   }
+  touchRowArr(rowArr) { // note a cell-level mutation of a row array
+    if (!rowArr) return;
+    if (!this.rowVer) this.rowVer = new WeakMap();
+    this.rowVer.set(rowArr, (this.rowVer.get(rowArr) || 0) + 1);
+  }
+  rowVersion(rowArr) { // mutation version of a row array (0 = never mutated)
+    if (!this.rowVer) return 0;
+    return this.rowVer.get(rowArr) || 0;
+  }
+
   eraseStyle() { // background-color-erase style: current bg, no other attrs
     return Object.freeze({ fg: null, bg: this.style.bg, bold: false, dim: false, italic: false,
                            underline: false, blink: false, reverse: false, strike: false });
@@ -373,7 +385,10 @@ class TermCore {
   printChar(ch, cp) {
     const width = tcCharWidth(cp);
     if (width === 0) { // combining / zero-width: attach to last printed cell
-      if (this.lastCell && this.lastCell.w !== 0) this.lastCell.t += ch;
+      if (this.lastCell && this.lastCell.w !== 0) {
+        this.lastCell.t += ch;
+        this.touchRowArr(this.lastCellRow);
+      }
       return;
     }
     if (this.wrapPending) {
@@ -384,6 +399,7 @@ class TermCore {
       if (lastRow[this.cols - 1].w === 0 && this.cols >= 2)
         lastRow[this.cols - 2] = { t: " ", w: 1, s: this.style };
       lastRow[this.cols - 1] = { t: " ", w: 1, s: this.style };
+      this.touchRowArr(lastRow);
       this.cx = 0; this.index();
     }
     const row = this.grid[this.cy];
@@ -410,7 +426,8 @@ class TermCore {
     row[this.cx] = cell;
     if (width === 2) row[this.cx + 1] = { t: "", w: 0, s: this.style };
     if (this.insertMode) this.fixRowPairs(this.cy); // the shift may have split a pair
-    this.lastCell = cell; this.lastChar = ch;
+    this.touchRowArr(row);
+    this.lastCell = cell; this.lastCellRow = row; this.lastChar = ch;
     if (this.cx + width >= this.cols) {
       if (this.wrapMode) { this.wrapPending = true; this.cx = this.cols - 1; }
       else this.cx = this.cols - 1;
@@ -426,6 +443,7 @@ class TermCore {
       else if (c.w === 2 && (x + 1 >= this.cols || row[x + 1].w !== 0))
         row[x] = { t: " ", w: 1, s: c.s };       // lead with no continuation
     }
+    this.touchRowArr(row);
   }
 
   eraseCells(y, x0, x1) { // inclusive range
@@ -435,6 +453,7 @@ class TermCore {
     if (x0 > 0 && row[x0] && row[x0].w === 0) x0--;
     if (x1 < this.cols - 1 && row[x1] && row[x1].w === 2) x1++;
     for (let x = x0; x <= x1 && x < this.cols; x++) row[x] = { t: " ", w: 1, s: es };
+    this.touchRowArr(row);
   }
 
   applySgr(params) {
@@ -648,8 +667,10 @@ class TermCore {
     }
   }
   doDecAln() { // ESC # 8: fill screen with E
-    for (let y = 0; y < this.rows; y++)
+    for (let y = 0; y < this.rows; y++) {
       for (let x = 0; x < this.cols; x++) this.grid[y][x] = { t: "E", w: 1, s: TC_DEF_STYLE };
+      this.touchRowArr(this.grid[y]);
+    }
   }
 
   feed(text) {
@@ -834,6 +855,8 @@ let rafHandle = null;     // pending requestAnimationFrame handle, if any
 let lastPaintAt = -Infinity; // performance.now() when the last render() finished
 let prevSbLen = 0;
 let charW = 8, lineH = 20;
+let termPadL = 0, termPadT = 0; // #term padding, cached by measure() for render()
+let wrapHCache = 0;             // termwrap height, cached by measure() for render()
 
 function colorCss(v, bold) {
   if (v === null || v === undefined) return null;
@@ -900,10 +923,12 @@ function rowSignature(rowArr, cursorX) {
   // Content address of one painted row: everything paintRow() can turn
   // into DOM — each visible cell's position, text, style and effective
   // background, plus which cell carries the cursor. Two rows with the
-  // same signature paint to identical DOM, so render() can reuse the
-  // existing element instead of rebuilding it. Fields are separated by
-  // \x01/\x02, which can occur neither in cell text (printables only)
-  // nor in style values (numbers, hex, rgb(...)).
+  // same signature paint to identical DOM. render() uses this only as a
+  // fallback for rows the identity+version fast path could not claim
+  // (apps that resend identical content into a different row array —
+  // e.g. a full repaint of a scrolled viewport). Fields are separated
+  // by \x01/\x02, which can occur neither in cell text (printables
+  // only) nor in style values (numbers, hex, rgb(...)).
   let sig = cursorX + "\x01";
   for (let x = 0; x < term.cols; x++) {
     const cell = rowArr[x];
@@ -917,31 +942,35 @@ function paintRow(rowEl, rowArr, cursorX) {
   const isCurRow = cursorX >= 0;
   rowEl.textContent = "";
   paintRowBackground(rowEl, rowArr, cursorX);
-  let span = null, spanKey = null;
-  const flushText = (cell, isCur) => {
+  // Accumulate each span's text in a plain string and assign it once:
+  // per-cell textContent += reads and rewrites the live text node.
+  let span = null, spanKey = null, spanText = "", madeCur = false;
+  const flushSpan = () => {
+    if (span) { span.textContent = spanText; span = null; spanText = ""; }
+  };
+  const addCell = (cell, isCur) => {
     const key = isCur ? " CUR" : styleKeyOf(cell.s);
     if (!span || key !== spanKey) {
+      flushSpan();
       span = document.createElement("span");
-      if (isCur) span.className = "cur";
+      if (isCur) { span.className = "cur"; madeCur = true; }
       else { const css = spanCss(cell.s); if (css) span.style.cssText = css; }
-      span.textContent = "";
       rowEl.appendChild(span);
       spanKey = key;
     }
-    span.textContent += cell.t;
+    spanText += cell.t;
   };
   for (let x = 0; x < term.cols; x++) {
     const cell = rowArr[x];
     if (!cell || cell.w === 0) continue;
-    flushText(cell, isCurRow && x === cursorX);
+    addCell(cell, isCurRow && x === cursorX);
   }
-  if (isCurRow) { // cursor past the last written cell / on a continuation cell
+  flushSpan();
+  if (isCurRow && !madeCur) { // cursor past the last written cell / on a continuation cell
     const cc = rowArr[cursorX];
-    if (!cc || cc.w === 0 || !rowEl.querySelector(".cur")) {
-      const s = document.createElement("span");
-      s.className = "cur"; s.textContent = cc && cc.w !== 0 ? cc.t : " ";
-      rowEl.appendChild(s);
-    }
+    const s = document.createElement("span");
+    s.className = "cur"; s.textContent = cc && cc.w !== 0 ? cc.t : " ";
+    rowEl.appendChild(s);
   }
   if (rowEl.childElementCount === 0) rowEl.textContent = " ";
 }
@@ -959,58 +988,92 @@ function render() {
     const d = document.createElement("div"); d.className = "trow"; termEl.appendChild(d);
   }
   const showCursor = viewOffset === 0 && term.cursorVisible;
-  // Reuse row elements by content: a row whose signature matches what an
-  // existing element already shows keeps its DOM untouched (no rebuild,
-  // no invalidation), and an element whose content merely moved — the
-  // common case when the grid scrolls — is repositioned, not repainted.
-  // Only rows with new content go through paintRow().
-  const reusable = new Map(); // signature -> elements currently showing it
+  // Reuse row elements by row-array identity + mutation version: an
+  // element already showing this exact row array, untouched since it was
+  // painted, keeps its DOM (no rebuild, no invalidation) and is only
+  // repositioned — the common case when the grid scrolls or the local
+  // view moves through scrollback. Rows the fast path misses fall back
+  // to content-signature matching against unclaimed elements (below),
+  // and only rows neither path can claim go through paintRow(). (The
+  // previous scheme ran the signature scan over every cell of every row
+  // on every frame, which cost more than the painting it saved at large
+  // grid sizes.)
+  const byRow = new Map(); // rowArr -> element currently showing it
   for (const el of termEl.children) {
-    if (el._rowSig === undefined) continue;
-    const bucket = reusable.get(el._rowSig);
-    if (bucket) bucket.push(el); else reusable.set(el._rowSig, [el]);
+    if (el._rowRef !== undefined && !byRow.has(el._rowRef)) byRow.set(el._rowRef, el);
   }
   const rowEls = new Array(term.rows);
   const claimed = new Set();
-  const pending = []; // rows that need a repaint: [y, rowArr, cursorX, sig]
+  const pending = []; // rows that need a repaint: [y, rowArr, cursorX]
   for (let y = 0; y < term.rows; y++) {
     const rowArr = combinedRow(base + y);
     const cursorX = showCursor && y === term.cy ? term.cx : -1;
-    const sig = rowSignature(rowArr, cursorX);
-    const bucket = reusable.get(sig);
-    if (bucket && bucket.length) {
-      const el = bucket.shift();
+    const el = byRow.get(rowArr);
+    if (el && !claimed.has(el) && el._rowVer === term.rowVersion(rowArr) && el._rowCur === cursorX) {
       claimed.add(el);
       rowEls[y] = el;
     } else {
-      pending.push([y, rowArr, cursorX, sig]);
+      pending.push([y, rowArr, cursorX]);
     }
   }
   if (pending.length) {
-    const spares = [];
-    for (const el of termEl.children) if (!claimed.has(el)) spares.push(el);
-    for (const [y, rowArr, cursorX, sig] of pending) {
-      let el = spares.length ? spares.shift() : null;
-      if (!el) { el = document.createElement("div"); el.className = "trow"; }
-      paintRow(el, rowArr, cursorX);
-      el._rowSig = sig;
-      rowEls[y] = el;
+    // Fallback for rows the fast path missed: an unclaimed element may
+    // already show byte-identical content painted for a different row
+    // array (an app resending a scrolled viewport wholesale). Matching
+    // by stored signature repositions it instead of repainting. The
+    // signature scan runs only over pending rows, never the full grid.
+    const bySig = new Map(); // signature -> unclaimed elements showing it
+    for (const el of termEl.children) {
+      if (claimed.has(el) || el._rowSig === undefined) continue;
+      const bucket = bySig.get(el._rowSig);
+      if (bucket) bucket.push(el); else bySig.set(el._rowSig, [el]);
+    }
+    const toPaint = [];
+    for (const [y, rowArr, cursorX] of pending) {
+      const sig = rowSignature(rowArr, cursorX);
+      const bucket = bySig.get(sig);
+      if (bucket && bucket.length) {
+        const el = bucket.shift();
+        claimed.add(el);
+        el._rowRef = rowArr;
+        el._rowVer = term.rowVersion(rowArr);
+        el._rowCur = cursorX;
+        rowEls[y] = el;
+      } else {
+        toPaint.push([y, rowArr, cursorX, sig]);
+      }
+    }
+    if (toPaint.length) {
+      const spares = [];
+      for (const el of termEl.children) if (!claimed.has(el)) spares.push(el);
+      for (const [y, rowArr, cursorX, sig] of toPaint) {
+        let el = spares.length ? spares.shift() : null;
+        if (!el) { el = document.createElement("div"); el.className = "trow"; }
+        paintRow(el, rowArr, cursorX);
+        el._rowRef = rowArr;
+        el._rowVer = term.rowVersion(rowArr);
+        el._rowCur = cursorX;
+        el._rowSig = sig;
+        rowEls[y] = el;
+      }
     }
   }
   for (let y = 0; y < term.rows; y++) {
     if (termEl.children[y] !== rowEls[y]) termEl.insertBefore(rowEls[y], termEl.children[y] || null);
   }
-  // Scrollbar thumb + IME textarea placement.
+  // Scrollbar thumb + IME textarea placement. Padding and wrap height
+  // come from measure()'s cache: reading them here (getComputedStyle /
+  // clientHeight after DOM writes) would force a synchronous style and
+  // layout flush inside every paint.
   const total = term.scrollback.length + term.rows;
   termwrap.classList.toggle("scrolled", viewOffset > 0);
   if (total > term.rows) {
-    const wrapH = termwrap.clientHeight;
+    const wrapH = wrapHCache || termwrap.clientHeight;
     sbthumb.style.height = Math.max(20, wrapH * term.rows / total) + "px";
     sbthumb.style.top = (wrapH * (term.scrollback.length - viewOffset) / total) + "px";
   }
-  const cs = getComputedStyle(termEl);
-  ime.style.left = (parseFloat(cs.paddingLeft) + term.cx * charW) + "px";
-  ime.style.top = (parseFloat(cs.paddingTop) + term.cy * lineH) + "px";
+  ime.style.left = (termPadL + term.cx * charW) + "px";
+  ime.style.top = (termPadT + term.cy * lineH) + "px";
   if (preeditText) {
     preeditEl.textContent = preeditText;
     preeditEl.style.left = ime.style.left;
@@ -1066,6 +1129,12 @@ function measure() {
   charW = r.width / 10 || 8;
   lineH = r.height || 20;
   termEl.removeChild(probe);
+  // measure() already forces layout for the probe; cache the values
+  // render() needs so it never reads layout state after its DOM writes.
+  const cs = getComputedStyle(termEl);
+  termPadL = parseFloat(cs.paddingLeft) || 0;
+  termPadT = parseFloat(cs.paddingTop) || 0;
+  wrapHCache = termwrap.clientHeight;
   const cols = Math.max(20, Math.floor((termwrap.clientWidth - 14) / charW));
   const rows = Math.max(5, Math.floor(termwrap.clientHeight / lineH));
   if (cols !== term.cols || rows !== term.rows) {

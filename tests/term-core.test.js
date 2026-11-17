@@ -582,5 +582,48 @@ function splitAfter(s, marker) { // [through marker, rest]
   eq(total, Math.floor(98 / 20), "wheelPlan: gesture total matches distance");
 }
 
+// --- 32. Row mutation versions (render() element-reuse key) -----------------
+// render() reuses a row's DOM element iff the row array is identical and
+// its version is unchanged, so every cell-level mutation path must bump
+// the version of the row array it writes — and pure cursor/scroll
+// movement must not.
+{
+  const t = new TermCore(10, 3);
+  const row0 = t.grid[0];
+  eq(t.rowVersion(row0), 0, "rowVer: fresh row starts at 0");
+  t.feed("ab");
+  eq(t.rowVersion(row0), 2, "rowVer: printChar bumps per char");
+  const v = t.rowVersion(row0);
+  t.feed("\x1b[3;1H"); // cursor move only
+  eq(t.rowVersion(row0), v, "rowVer: cursor move does not bump");
+  t.feed("\x1b[K");
+  ok(t.rowVersion(t.grid[2]) > 0, "rowVer: erase-in-line bumps its row");
+  eq(t.rowVersion(row0), v, "rowVer: erase on another row leaves this one");
+  t.feed("\x1b[1;1H\x1b[2P"); // DCH on row 0
+  ok(t.rowVersion(row0) > v, "rowVer: DCH bumps its row");
+  const v2 = t.rowVersion(row0);
+  t.feed("\x1b[2@"); // ICH on row 0
+  ok(t.rowVersion(row0) > v2, "rowVer: ICH bumps its row");
+  const v3 = t.rowVersion(row0);
+  t.feed("́"); // combining char attaches to lastCell
+  ok(t.rowVersion(row0) > v3, "rowVer: combining char bumps the cell's row");
+  const t2 = new TermCore(4, 2);
+  t2.feed("xy\x1b[2J");
+  ok(t2.rowVersion(t2.grid[0]) > 0 && t2.rowVersion(t2.grid[1]) > 0,
+     "rowVer: erase-in-display bumps all rows");
+  const t3 = new TermCore(4, 2);
+  t3.feed("\x1b#8");
+  ok(t3.rowVersion(t3.grid[0]) > 0 && t3.rowVersion(t3.grid[1]) > 0,
+     "rowVer: DECALN bumps all rows");
+  // A row scrolled into scrollback keeps identity + version (no bump):
+  // the local-scroll fast path repositions its element without repaint.
+  const t4 = new TermCore(4, 2);
+  t4.feed("one\r\ntwo\r\nthree\r\n");
+  const sbRow = t4.scrollback[t4.scrollback.length - 1];
+  const sbVer = t4.rowVersion(sbRow);
+  t4.feed("four\r\n");
+  eq(t4.rowVersion(sbRow), sbVer, "rowVer: scrollback row is not mutated by later output");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);
