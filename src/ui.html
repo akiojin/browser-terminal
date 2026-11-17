@@ -1071,7 +1071,9 @@ function connect() {
 function sendInput(data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "input", data }));
+    return true;
   }
+  return false;
 }
 function sendResize(cols, rows) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1170,7 +1172,12 @@ ime.addEventListener("keydown", (e) => {
 ime.addEventListener("input", () => {
   // Fallback delivery for keyboards that report key "Unidentified" (Gboard etc.)
   if (composing) return;
-  if (ime.value) { sendInput(ime.value); ime.value = ""; if (viewOffset) { viewOffset = 0; requestRender(); } }
+  if (ime.value) {
+    // Clear only on a successful send: while disconnected, the text stays
+    // in the field and goes out with the next input event after recovery
+    // instead of vanishing without a trace.
+    if (sendInput(ime.value)) { ime.value = ""; if (viewOffset) { viewOffset = 0; requestRender(); } }
+  }
 });
 ime.addEventListener("compositionstart", (e) => { composing = true; preeditText = e.data || ""; requestRender(); });
 ime.addEventListener("compositionupdate", (e) => { preeditText = e.data || ""; requestRender(); });
@@ -1178,8 +1185,11 @@ ime.addEventListener("compositionend", (e) => {
   composing = false;
   preeditText = "";
   requestRender();
-  if (e.data) sendInput(e.data);
-  ime.value = "";
+  if (e.data && !sendInput(e.data)) {
+    ime.value = e.data; // undelivered: the next input event retries it
+  } else {
+    ime.value = "";
+  }
 });
 function pasteIntoTerminal(text) {
   if (!text) return;
