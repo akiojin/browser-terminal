@@ -145,6 +145,22 @@ const TC_PALETTE256 = (() => {
 })();
 const TC_DEF_STYLE = Object.freeze({ fg: null, bg: null, bold: false, dim: false, italic: false,
                                      underline: false, blink: false, reverse: false, strike: false });
+// Default terminal colors reported for OSC 10/11 queries. These mirror the
+// CSS theme (--term-fg / --bg in the style block); the UI layer reads the
+// live CSS values and passes them as TermCore opts, so in the browser the
+// stylesheet is the single source of truth and these are only the fallback
+// for headless use and tests.
+const TC_TERM_FG = "#d8dee9";
+const TC_TERM_BG = "#0c0f14";
+function tcHexColor(v) { // "#rrggbb" (any case) -> normalized, else null
+  if (typeof v !== "string") return null;
+  const m = /^#([0-9a-fA-F]{6})$/.exec(v.trim());
+  return m ? "#" + m[1].toLowerCase() : null;
+}
+function tcOscColorReply(cmd, hex) { // OSC 10/11 query reply; channels at 16 bit
+  const c16 = (i) => (parseInt(hex.slice(i, i + 2), 16) * 0x101).toString(16).padStart(4, "0");
+  return "\x1b]" + cmd + ";rgb:" + c16(1) + "/" + c16(3) + "/" + c16(5) + "\x1b\\";
+}
 // DEC special graphics (line drawing) character map for charset "0".
 const TC_DEC_GRAPHICS = { "`": "◆", a: "▒", b: "␉", c: "␌", d: "␍", e: "␊", f: "°", g: "±",
   h: "␤", i: "␋", j: "┘", k: "┐", l: "┌", m: "└", n: "┼", o: "⎺", p: "⎻", q: "─", r: "⎼",
@@ -186,7 +202,9 @@ class TermCore {
     opts = opts || {};
     this.scrollbackLimit = opts.scrollbackLimit || 5000;
     this.rowVer = new WeakMap(); // row array -> mutation version (render reuse key)
-    this.onResponse = null;      // (string) => void, for DSR/DA replies
+    this.onResponse = null;      // (string) => void, for DSR/DA/OSC replies
+    this.termFg = tcHexColor(opts.fg) || TC_TERM_FG; // reported for OSC 10;?
+    this.termBg = tcHexColor(opts.bg) || TC_TERM_BG; // reported for OSC 11;?
     this.cols = Math.max(2, cols | 0);
     this.rows = Math.max(1, rows | 0);
     this.resetAll();
@@ -213,6 +231,7 @@ class TermCore {
     this.mouseModes = new Set(); // ?1000/1002/1003 tracking, ?1006 SGR encoding
     this.g0 = "B"; this.g1 = "B"; this.gl = 0;
     this.state = "ground"; this.escBuf = ""; this.csiPrefix = "";
+    this.oscBuf = ""; this.oscKind = ""; // escape-string content / opener kind
     this.lastCell = null;        // for combining chars / REP
     this.lastCellRow = null;     // row array holding lastCell
     this.lastChar = null;
@@ -599,9 +618,12 @@ class TermCore {
       }
       case "s": this.saved = this.saveCursor(); break;
       case "u": { // SCOR (restore cursor) is the UNPREFIXED form only. Prefixed
-        // CSI u (>, <, =, ?) is the Kitty keyboard protocol (push/pop/query
-        // enhancement flags) and must not move the cursor.
-        if (prefix === "") this.restoreCursor(this.saved); break;
+        // CSI u is the Kitty keyboard protocol: ">" pushes flags, "<" pops,
+        // "=" sets, and "?" is the flags query. The query gets an answer of
+        // 0 (no enhancements supported); the rest must not move the cursor.
+        if (prefix === "") this.restoreCursor(this.saved);
+        else if (prefix === "?" && raw === "" && this.onResponse) this.onResponse("\x1b[?0u");
+        break;
       }
       case "m": { // SGR is the UNPREFIXED form only. CSI > ... m is XTMODKEYS
         // (modifyOtherKeys) and CSI ? ... m is a private mode report; neither
@@ -636,9 +658,11 @@ class TermCore {
         }
         break;
       }
-      case "c": { // primary DA: answer the UNPREFIXED query only. CSI > c is
-        // the secondary DA query and must not get a primary response.
-        if (this.onResponse && prefix === "" && (raw === "" || nums[0] === 0)) this.onResponse("\x1b[?62c");
+      case "c": { // primary DA: answer the UNPREFIXED query only, with the
+        // VT220-style response (same value xterm.js reports and the one
+        // measured to satisfy Codex's startup probe). CSI > c is the
+        // secondary DA query and gets no response here (see test 19).
+        if (this.onResponse && prefix === "" && (raw === "" || nums[0] === 0)) this.onResponse("\x1b[?1;2c");
         break;
       }
       case "n": { // device status report
@@ -666,6 +690,22 @@ class TermCore {
       default: break; // =, >, etc: ignored
     }
   }
+  doOsc(payload) { // a terminated OSC string (ESC ] ... BEL / ST)
+    // Only the color queries are answered: OSC 10;? asks the foreground
+    // color, OSC 11;? the background. Setting forms and every other OSC
+    // (window title, hyperlinks, ...) stay unanswered and undrawn, exactly
+    // as before. Apps probe these at startup to pick a theme; with no
+    // answer their theme detection fails (measured with Codex: the
+    // composer band loses its background color).
+    if (!this.onResponse) return;
+    if (payload === "10;?") this.onResponse(tcOscColorReply(10, this.termFg));
+    else if (payload === "11;?") this.onResponse(tcOscColorReply(11, this.termBg));
+  }
+  endString() { // BEL or ST terminated an escape string (OSC / DCS / APC ...)
+    if (this.oscKind === "osc") this.doOsc(this.oscBuf);
+    this.oscBuf = "";
+    this.state = "ground";
+  }
   doDecAln() { // ESC # 8: fill screen with E
     for (let y = 0; y < this.rows; y++) {
       for (let x = 0; x < this.cols; x++) this.grid[y][x] = { t: "E", w: 1, s: TC_DEF_STYLE };
@@ -692,8 +732,8 @@ class TermCore {
         }
         case "esc": {
           if (ch === "[") { this.state = "csi"; this.escBuf = ""; this.csiPrefix = ""; }
-          else if (ch === "]") this.state = "osc";
-          else if (ch === "P" || ch === "X" || ch === "^" || ch === "_") this.state = "osc";
+          else if (ch === "]") { this.state = "osc"; this.oscBuf = ""; this.oscKind = "osc"; }
+          else if (ch === "P" || ch === "X" || ch === "^" || ch === "_") { this.state = "osc"; this.oscBuf = ""; this.oscKind = "str"; }
           else if (ch === "(") this.state = "charset0";
           else if (ch === ")") this.state = "charset1";
           else if (ch === "#") this.state = "escHash";
@@ -704,12 +744,19 @@ class TermCore {
         case "charset0": this.g0 = ch; this.state = "ground"; break;
         case "charset1": this.g1 = ch; this.state = "ground"; break;
         case "escHash": if (ch === "8") this.doDecAln(); this.state = "ground"; break;
-        case "osc": { // consume until BEL or ESC \
-          if (ch === "\x07") this.state = "ground";
+        case "osc": { // consume until BEL or ESC \; content is buffered so
+          // OSC queries can be answered at the terminator (doOsc). Other
+          // string types (DCS/APC/...) are buffered too but never acted on.
+          if (ch === "\x07") this.endString();
           else if (ch === "\x1b") this.state = "oscEsc";
+          else if (this.oscBuf.length < 1024) this.oscBuf += ch;
           break;
         }
-        case "oscEsc": this.state = ch === "\\" ? "ground" : "osc"; break;
+        case "oscEsc": {
+          if (ch === "\\") this.endString();
+          else this.state = "osc";
+          break;
+        }
         case "csi": {
           if (cp >= 0x40 && cp <= 0x7e) { this.doCsi(ch); this.state = "ground"; }
           else if (cp >= 0x30 && cp <= 0x3f) {
@@ -846,7 +893,13 @@ const ime = document.getElementById("ime");
 const preeditEl = document.getElementById("preedit");
 let preeditText = "";   // IME composition (preedit) string shown at the cursor while composing
 const sbthumb = document.getElementById("sbthumb");
-const term = new TermCore(80, 24);
+// The terminal colors TermCore reports for OSC 10/11 queries come from the
+// CSS theme itself, so the stylesheet stays the single source of truth.
+const rootStyle = getComputedStyle(document.documentElement);
+const term = new TermCore(80, 24, {
+  fg: rootStyle.getPropertyValue("--term-fg").trim() || undefined,
+  bg: rootStyle.getPropertyValue("--bg").trim() || undefined,
+});
 let viewOffset = 0;       // lines scrolled back into history (0 = live)
 let wheelAcc = 0;         // sub-line wheel delta accumulated for app forwarding
 let localWheelAcc = 0;    // sub-line wheel delta accumulated for local scrolling

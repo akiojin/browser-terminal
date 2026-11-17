@@ -625,5 +625,71 @@ function splitAfter(s, marker) { // [through marker, rest]
   eq(t4.rowVersion(sbRow), sbVer, "rowVer: scrollback row is not mutated by later output");
 }
 
+// 33. Terminal queries: OSC 10/11 color reports, primary DA, kitty flags
+// query. Apps (Codex measured) probe these at startup to pick a theme;
+// the replies must go through onResponse and never reach the screen.
+{
+  const t = new TermCore(80, 24);
+  const resps = [];
+  t.onResponse = (s) => { resps.push(s); };
+  t.feed("\x1b]11;?\x1b\\");
+  eq(resps.join(""), "\x1b]11;rgb:0c0c/0f0f/1414\x1b\\", "OSC 11;? reports the theme background (ST)");
+  resps.length = 0;
+  t.feed("\x1b]10;?\x07");
+  eq(resps.join(""), "\x1b]10;rgb:d8d8/dede/e9e9\x1b\\", "OSC 10;? reports the theme foreground (BEL)");
+  resps.length = 0;
+  t.feed("\x1b]10;rgb:0000/0000/0000\x07"); // setting form: not a query
+  eq(resps.length, 0, "OSC 10 set form gets no reply");
+  t.feed("\x1b]0;window title\x07");
+  eq(resps.length, 0, "OSC 0 (title) gets no reply");
+  eq(t.screenText().trim(), "", "OSC content is never drawn");
+  t.feed("\x1b[c");
+  eq(resps.join(""), "\x1b[?1;2c", "primary DA answers VT220-style");
+  resps.length = 0;
+  t.feed("\x1b[?u");
+  eq(resps.join(""), "\x1b[?0u", "kitty flags query answers 0 (unsupported)");
+  resps.length = 0;
+  t.feed("\x1b[>7u"); // kitty push: not a query
+  eq(resps.length, 0, "kitty push gets no reply");
+  // A query split across feeds still answers once, at the terminator.
+  t.feed("\x1b]11");
+  eq(resps.length, 0, "no reply before the OSC terminator");
+  t.feed(";?\x1b\\");
+  eq(resps.join(""), "\x1b]11;rgb:0c0c/0f0f/1414\x1b\\", "split OSC 11;? answers at ST");
+}
+{
+  // Caller-supplied theme colors (the UI layer passes the CSS variables).
+  const t = new TermCore(80, 24, { fg: "#112233", bg: "#AABBCC" });
+  const resps = [];
+  t.onResponse = (s) => { resps.push(s); };
+  t.feed("\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+  eq(resps.join(""), "\x1b]10;rgb:1111/2222/3333\x1b\\\x1b]11;rgb:aaaa/bbbb/cccc\x1b\\",
+     "OSC replies use the configured colors, channels scaled to 16 bit");
+  const t2 = new TermCore(80, 24, { fg: "red", bg: "#12345" }); // invalid: defaults
+  const resps2 = [];
+  t2.onResponse = (s) => { resps2.push(s); };
+  t2.feed("\x1b]11;?\x07");
+  eq(resps2.join(""), "\x1b]11;rgb:0c0c/0f0f/1414\x1b\\", "invalid color opts fall back to the theme defaults");
+}
+{
+  // Real stream: Codex 0.164.0-alpha.9 (VM) startup, the first 55 bytes of
+  // a pty recording (the same probe column bt-scroll-perf/cap_vm.py
+  // answers). The probes arrive in this order: DSR 6n, OSC 10;?, OSC 11;?,
+  // kitty query, primary DA — and the replies must come back in order.
+  const raw = Buffer.from("G1s/MjAwNGgbWz40OzBtG1s+N3UbWz8xMDA0aBtbNm4bXTEwOz8bXBtdMTE7PxtcG1s/dRtbYw==", "base64").toString("utf8");
+  const t = new TermCore(120, 30);
+  const resps = [];
+  t.onResponse = (s) => { resps.push(s); };
+  t.feed(raw);
+  eq(resps.join(""),
+     "\x1b[1;1R" +
+     "\x1b]10;rgb:d8d8/dede/e9e9\x1b\\" +
+     "\x1b]11;rgb:0c0c/0f0f/1414\x1b\\" +
+     "\x1b[?0u" +
+     "\x1b[?1;2c",
+     "Codex startup probes get the full reply column in order");
+  eq(t.screenText().trim(), "", "Codex probe bytes draw nothing");
+}
+
 console.log(failures === 0 ? "\nALL UNIT TESTS PASSED" : "\n" + failures + " UNIT TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);
