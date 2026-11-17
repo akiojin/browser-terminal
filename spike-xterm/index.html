@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>bt xterm spike</title>
+<link rel="stylesheet" href="/nm/@xterm/xterm/css/xterm.css">
+<style>
+  :root { --bg: #0c0f14; --term-fg: #d8dee9; }
+  body { margin: 0; background: var(--bg); color: #e6ebf2;
+         font-family: system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; gap: 8px; align-items: center; padding: 6px 10px;
+           background: #12161d; font-size: 13px; }
+  header button { font-size: 12.5px; }
+  #termwrap { flex: 1; position: relative; overflow: hidden; }
+  #term { position: absolute; inset: 0; padding: 0.5em 0.6em; }
+</style>
+</head>
+<body>
+<header>
+  <span id="status">init</span>
+  <span id="sessionlabel"></span>
+  <button id="reconnect">Reconnect</button>
+  <button id="copyscreen">Copy screen</button>
+  <button id="shot">Screenshot</button>
+  <span id="flash"></span>
+</header>
+<div id="termwrap"><div id="term"></div></div>
+<script src="/nm/@xterm/xterm/lib/xterm.js"></script>
+<script src="/nm/@xterm/addon-fit/lib/addon-fit.js"></script>
+<script src="/nm/@xterm/addon-serialize/lib/addon-serialize.js"></script>
+<script src="/nm/@xterm/addon-webgl/lib/addon-webgl.js"></script>
+<script src="/client.js"></script>
+</body>
+</html>
