@@ -22,7 +22,7 @@ const { repairNodePtySpawnHelpers, probePtySpawn } = require('./spawn-helper');
 const { createOsc7Tracker, readProcCwd, parseLsofCwd } = require('./cwd');
 const { idleTimeoutMs, isIdle, sweepIntervalMs } = require('./idle');
 const { trimScrollback } = require('./scrollback');
-const { shellArgs } = require('./shell');
+const { shellArgs, resolveWindowsShellPath } = require('./shell');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -215,19 +215,29 @@ function audit(sessionName, via, line) {
 // Shell selection
 // ---------------------------------------------------------------------------
 
-function programExists(prog) {
+function wherePath(prog) {
   try {
-    execFileSync('where', [prog], { stdio: 'ignore' });
-    return true;
+    const out = execFileSync('where', [prog], { encoding: 'utf8' });
+    const first = out
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .find((s) => s.length > 0);
+    return first && fs.existsSync(first) ? first : null;
   } catch (_) {
-    return false;
+    return null;
   }
 }
 
 function shellCommand() {
   if (process.platform === 'win32') {
-    const shell =
-      CONFIG.shell || (programExists('pwsh') ? 'pwsh' : 'powershell');
+    // node-pty cannot spawn a bare "powershell" name on Windows; resolve
+    // to an absolute path (see src/shell.js).
+    const shell = resolveWindowsShellPath({
+      configShell: CONFIG.shell,
+      where: wherePath,
+      exists: (p) => fs.existsSync(p),
+      systemRoot: process.env.SystemRoot,
+    });
     return { file: shell, args: shellArgs(process.platform) };
   }
   const shell =

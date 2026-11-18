@@ -16,7 +16,7 @@ const WebSocket = require("ws");
 const { parseOsc7Payload, createOsc7Tracker, readProcCwd, parseLsofCwd } = require("../src/cwd");
 const { idleTimeoutMs, isIdle, sweepIntervalMs } = require("../src/idle");
 const { launchAgentPlist, systemdUnit, servicePlan, LAUNCHD_LABEL } = require("../src/service-helper");
-const { shellArgs } = require("../src/shell");
+const { shellArgs, resolveWindowsShellPath } = require("../src/shell");
 const { scrollbackCutOffset, trimScrollback } = require("../src/scrollback");
 
 let failures = 0;
@@ -127,6 +127,28 @@ function ok(cond, name) { eq(!!cond, true, name); }
      "shellArgs: linux is login + interactive");
   eq(JSON.stringify(shellArgs("win32")), JSON.stringify(["-NoLogo"]),
      "shellArgs: windows keeps -NoLogo only");
+
+  // Windows shell resolution: node-pty cannot spawn a bare name, so the
+  // default must be an absolute path (config override wins as-is).
+  eq(resolveWindowsShellPath({ configShell: "C:\\custom\\pwsh.exe",
+       where: () => "C:\\other\\pwsh.exe", exists: () => true,
+       systemRoot: "C:\\Windows" }),
+     "C:\\custom\\pwsh.exe",
+     "winShell: config override wins");
+  eq(resolveWindowsShellPath({ configShell: undefined,
+       where: (p) => (p === "pwsh" ? "C:\\Program Files\\PowerShell\\7\\pwsh.exe" : null),
+       exists: () => true, systemRoot: "C:\\Windows" }),
+     "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+     "winShell: pwsh found via where");
+  eq(resolveWindowsShellPath({ configShell: undefined,
+       where: (p) => (p === "powershell" ? "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" : null),
+       exists: () => true, systemRoot: "C:\\Windows" }),
+     "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+     "winShell: powershell found via where");
+  eq(resolveWindowsShellPath({ configShell: undefined,
+       where: () => null, exists: () => true, systemRoot: "D:\\WinRoot" }),
+     path.join("D:\\WinRoot", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+     "winShell: SystemRoot fallback path");
 
   // End-to-end: with the POSIX args, a real bash must read ~/.bash_profile
   // (a login-only startup file). The marker is set nowhere else, so seeing

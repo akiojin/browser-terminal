@@ -228,6 +228,14 @@ command prints Task Scheduler guidance instead.
   No prebuilt binary matched your platform and the native toolchain is
   missing. Install it (see Prerequisites) and run `npm install` again.
 
+- **Windows: `Failed to start session: spawn shell failed: File not found`.**
+  The shell could not be resolved to an executable. The server resolves
+  the Windows shell to an absolute path on its own (`where pwsh`, then
+  `where powershell`, then the stock `%SystemRoot%` location), so on a
+  current build just restart the server. If it still fails, set `shell`
+  in the config to the absolute path of `powershell.exe` (see
+  Configuration) and restart.
+
 ## Configuration
 
 ```toml
@@ -236,6 +244,8 @@ token = "..."             # generated on first run; keep secret
 bind = "127.0.0.1"        # v1: localhost only
 api_enabled = false       # enable the agent API
 # shell = "/bin/zsh"      # optional shell override
+                          # (Windows: absolute path, e.g.
+                          #  "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
 scrollback_bytes = 262144 # raw scrollback kept per session
 # audit_log = "audit.log" # path (relative to the config dir)
 idle_timeout_minutes = 0  # close sessions with no input/output this long; 0 = never
