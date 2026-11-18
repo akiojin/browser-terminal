@@ -24,6 +24,34 @@ See [docs/design.md](docs/design.md) for the design notes (Japanese).
 
 > An earlier Rust implementation is preserved on the `rust-impl` branch.
 
+## Why this exists: terminal access for Muse
+
+This tool was built for [Muse](https://muse.ai), Meta's personal AI agent.
+Muse helps with work on the user's own machines, but two hard constraints
+leave it with no way to run a shell command there:
+
+- **Muse cannot operate terminal apps.** Its computer control explicitly
+  excludes terminal and scripting apps (Terminal.app and the like), so even
+  on a Mac it can otherwise see and control, there is no terminal it is
+  allowed to type into.
+- **Muse cannot reach the machine's localhost from its own browser.**
+  Muse's cloud browser, and any fresh browser window it opens, runs in
+  Muse's environment — `127.0.0.1` there is not the user's machine. The
+  browser-terminal page only works when it is open inside the *user's own*
+  browser, on the machine itself.
+
+browser-terminal bridges that gap. Start the server on the machine and
+open its page in the user's Chrome; from then on Muse can drive that
+machine's terminal through the page, in either of two ways:
+
+- **Through the Chrome extension** — Muse running on the user's Chrome
+  works directly in the browser-terminal tab.
+- **Through the desktop app** — Muse in the Mac app operates the user's
+  Chrome (opening the browser-terminal tab itself) and works through it.
+
+The access token is entered by the user: when the page asks for the
+token, the user types it. Muse never holds or handles the token value.
+
 ## Security model
 
 This tool exposes a shell. It is built to be safe by default:
